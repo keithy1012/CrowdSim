@@ -1,0 +1,21 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build",
+            "type": "shell",
+            "command": "cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_OSX_SYSROOT=$(xcrun --sdk macosx --show-sdk-path) && cmake --build build --parallel",
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "always", "panel": "shared" },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Run",
+            "type": "shell",
+            "command": "open build/CrowdSim.app",
+            "dependsOn": "Build",
+            "group": "test",
+            "presentation": { "reveal": "always", "panel": "shared" }
+        }
+    ]
+}

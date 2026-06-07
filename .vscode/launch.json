@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CrowdSim (Debug)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/CrowdSim.app/Contents/MacOS/CrowdSim",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build"
+        }
+    ]
+}
