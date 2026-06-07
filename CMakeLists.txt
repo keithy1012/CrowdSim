@@ -16,6 +16,7 @@ set(SOURCES
     src/main.mm
     src/AppDelegate.mm
     src/Renderer.mm
+    src/Simulation.cpp
 )
 
 add_executable(CrowdSim MACOSX_BUNDLE ${SOURCES})
@@ -24,6 +25,10 @@ target_include_directories(CrowdSim PRIVATE
     src
     # Required when building against Command Line Tools SDK without full Xcode
     ${CMAKE_OSX_SYSROOT}/usr/include/c++/v1
+)
+
+target_compile_options(CrowdSim PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
 )
 
 target_link_libraries(CrowdSim

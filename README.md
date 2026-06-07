@@ -29,6 +29,16 @@ Simulates tens to hundreds of thousands of autonomous agents in real time using 
 - Metal shader compilation wired into CMake (requires full Xcode; stubs in place)
 - VS Code configured with IntelliSense, build task (`Cmd+Shift+B`), and LLDB debug launch (`F5`)
 
+**Phase 1 — CPU Prototype (complete)**
+
+- `Simulation` class with pre-allocated SoA force accumulators (`_fx`, `_fy`)
+- Two-pass update: forces accumulated first (reads clean previous-frame state), then velocity and position integrated
+- Four steering behaviors: goal seeking, separation (distance-weighted), alignment, cohesion
+- O(N²) neighbor scan with early squared-distance reject
+- Agents wrap at world edges and reassign random targets on arrival
+- Instanced circle rendering via `vs_agent` / `fs_agent` Metal shaders — positions uploaded from CPU each frame
+- Verified: 1,000 agents at 60 FPS (Debug); scale `kAgentCount` in `AppDelegate.mm` to benchmark 10K
+
 ---
 
 ## Project Structure
@@ -38,11 +48,12 @@ CrowdSim/
 ├── CMakeLists.txt          — Build system
 ├── src/
 │   ├── Agent.h             — SoA agent buffer layout
+│   ├── Simulation.h/.cpp   — CPU steering loop (seek, separate, align, cohere)
 │   ├── main.mm             — App entry point
-│   ├── AppDelegate.h/.mm   — Window and MTKView setup
-│   └── Renderer.h/.mm      — Metal render loop (MTKViewDelegate)
+│   ├── AppDelegate.h/.mm   — Window, MTKView, and Simulation setup
+│   └── Renderer.h/.mm      — Metal pipeline, instanced draw, per-frame upload
 ├── shaders/
-│   └── Shaders.metal       — GPU compute and render shaders
+│   └── Shaders.metal       — vs_agent / fs_agent (circle instancing)
 └── .vscode/
     ├── tasks.json          — Build / Run tasks
     ├── launch.json         — LLDB debug configuration
@@ -88,44 +99,14 @@ Or in VS Code: `F5` to build and launch under LLDB.
 
 The simulation scales through four milestones, each adding a layer of GPU acceleration:
 
-| Phase | Feature | Agent Target |
-|---|---|---|
-| 0 | Project setup, window, render loop | — |
-| 1 | CPU prototype, steering behaviors | 10K @ 60 FPS |
-| 2 | Metal GPU port, 4 compute passes | 50K @ 60 FPS |
-| 3 | Spatial hash grid on GPU | 100K @ 60 FPS |
-| 4 | Obstacle avoidance, scenarios | 250K @ 60 FPS |
-| Stretch | Flow fields, ORCA, profiling dashboard | 500K+ @ 60 FPS |
-
----
-
-## Phase 1 — CPU Prototype
-
-**Goal:** Prove the simulation logic before moving it to the GPU.
-
-**Agent data** uses the SoA layout already defined in `Agent.h`. Each frame runs four steering behaviors:
-
-- **Goal seeking** — desired direction toward target, normalized to preferred velocity
-- **Separation** — repulsion force from agents within a minimum radius
-- **Alignment** — steer to match average velocity of local neighbors
-- **Cohesion** — steer toward the centroid of local neighbors
-
-**Neighbor search** in Phase 1 is naive O(N²) — every agent scanned against every other agent. Acceptable at 10K agents; replaced by spatial hashing in Phase 3.
-
-**Simulation loop** (CPU, runs once per frame):
-
-```
-For each agent:
-    Collect neighbors (O(N²) scan)
-    Compute steering forces
-    Integrate velocity
-    Clamp to maxSpeed
-    Integrate position
-```
-
-**Rendering** uses instanced draw of simple circles. Agent positions are uploaded to a Metal vertex buffer each frame from the CPU SoA arrays.
-
-**Target:** 10,000 agents at 60 FPS.
+| Phase | Feature | Agent Target | Status |
+|---|---|---|---|
+| 0 | Project setup, window, render loop | — | Complete |
+| 1 | CPU prototype, steering behaviors | 10K @ 60 FPS | Complete |
+| 2 | Metal GPU port, 4 compute passes | 50K @ 60 FPS | Next |
+| 3 | Spatial hash grid on GPU | 100K @ 60 FPS | |
+| 4 | Obstacle avoidance, scenarios | 250K @ 60 FPS | |
+| Stretch | Flow fields, ORCA, profiling dashboard | 500K+ @ 60 FPS | |
 
 ---
 
