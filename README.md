@@ -8,14 +8,14 @@ Simulates tens to hundreds of thousands of autonomous agents in real time using 
 
 ## Platform
 
-| | |
-|---|---|
-| Hardware | Apple Silicon (M2+) |
-| OS | macOS |
-| GPU API | Metal |
+|          |                       |
+| -------- | --------------------- |
+| Hardware | Apple Silicon (M2+)   |
+| OS       | macOS                 |
+| GPU API  | Metal                 |
 | Language | C++20 / Objective-C++ |
-| Build | CMake 3.20+ |
-| Editor | VS Code |
+| Build    | CMake 3.20+           |
+| Editor   | VS Code               |
 
 ---
 
@@ -97,16 +97,16 @@ Or in VS Code: `F5` to build and launch under LLDB.
 
 ## Project Outline
 
-| Phase | Focus | Agent Target | Status |
-|---|---|---|---|
-| 0 | Project setup, render loop, build system | — | Complete |
-| 1 | CPU prototype, steering behaviors | 10K @ 60 FPS | Complete |
-| 2 | GPU compute port (Metal) | 50K @ 60 FPS | Next |
-| 3 | Spatial hashing + GPU neighbor search | 100K @ 60 FPS | Planned |
-| 4 | CPU vs GPU benchmarking suite | 100K+ | Planned |
-| 5 | Obstacle avoidance + crowd scenarios | 250K @ 60 FPS | Planned |
-| 6 | Flow fields and ORCA navigation | 250K+ @ 60 FPS | Planned |
-| Stretch | 500K+ agents, GPU profiling dashboard | 500K+ @ 60 FPS | Planned |
+| Phase   | Focus                                    | Agent Target   | Status   |
+| ------- | ---------------------------------------- | -------------- | -------- |
+| 0       | Project setup, render loop, build system | —              | Complete |
+| 1       | CPU prototype, steering behaviors        | 10K @ 60 FPS   | Complete |
+| 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Next     |
+| 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Planned  |
+| 4       | CPU vs GPU benchmarking suite            | 100K+          | Planned  |
+| 5       | Obstacle avoidance + crowd scenarios     | 250K @ 60 FPS  | Planned  |
+| 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Planned  |
+| Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
 
 ---
 
@@ -181,23 +181,26 @@ Most simulation projects stop after getting something working. CrowdSim includes
 
 **Implementations compared:**
 
-*CPU — Single Thread*
+_CPU — Single Thread_
+
 ```
 Agent Update → O(N²) Neighbor Search → Steering → Integration
 ```
 
-*CPU — Multi-Threaded*
+_CPU — Multi-Threaded_
 
 Workload divided across worker threads:
+
 ```
 Thread 1 → Agents 0–9,999
 Thread 2 → Agents 10,000–19,999
 ...
 ```
 
-*GPU — Metal*
+_GPU — Metal_
 
 One GPU thread per agent:
+
 ```
 Thread 0 → Agent 0
 Thread 1 → Agent 1
@@ -214,12 +217,12 @@ Thread 1 → Agent 1
 
 **Output:** Benchmark reports and scaling curves.
 
-| Agents | CPU | GPU |
-|---|---|---|
-| 10K | 60 FPS | 60 FPS |
-| 50K | 18 FPS | 60 FPS |
-| 100K | 7 FPS | 60 FPS |
-| 250K | 2 FPS | 51 FPS |
+| Agents | CPU    | GPU    |
+| ------ | ------ | ------ |
+| 10K    | 60 FPS | 60 FPS |
+| 50K    | 18 FPS | 60 FPS |
+| 100K   | 7 FPS  | 60 FPS |
+| 250K   | 2 FPS  | 51 FPS |
 
 **Goal:** Demonstrate measurable performance gains from GPU acceleration and algorithmic optimization.
 
@@ -261,12 +264,12 @@ Adjust velocity
 
 **Visualization modes:**
 
-| Mode | Color encoding |
-|---|---|
-| Simple | White circles |
-| Velocity | Hue maps to speed |
-| Density | Red = high local density |
-| Flow | Direction vectors per agent |
+| Mode     | Color encoding              |
+| -------- | --------------------------- |
+| Simple   | White circles               |
+| Velocity | Hue maps to speed           |
+| Density  | Red = high local density    |
+| Flow     | Direction vectors per agent |
 
 **Target:** 250,000 agents at 60 FPS.
 
@@ -329,6 +332,12 @@ Render time    |  4.1 ms
 Timing captured with `MTLCommandBuffer` completion handlers and a ring buffer of frame samples.
 
 **Long-term goal:** Build a simulation engine combining parallel computing, GPU programming, performance engineering, AI navigation, real-time rendering, and large-scale systems optimization.
+
+---
+
+## Stretch Goal 2 - Stadium / Building Evacuation Safety Simulator
+
+- Allow user to build out 2D or 3D map with obstacle walls, set target entry/exit points, and let the simulation run with X agents.
 
 ---
 

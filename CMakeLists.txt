@@ -17,6 +17,7 @@ set(SOURCES
     src/AppDelegate.mm
     src/Renderer.mm
     src/Simulation.cpp
+    src/GPUSimulation.mm
 )
 
 add_executable(CrowdSim MACOSX_BUNDLE ${SOURCES})
@@ -64,8 +65,10 @@ if(METAL_FOUND EQUAL 0)
 
     add_custom_command(
         OUTPUT ${AIR_FILE}
-        COMMAND xcrun -sdk macosx metal -c ${METAL_SRC} -o ${AIR_FILE}
-        DEPENDS ${METAL_SRC}
+        COMMAND xcrun -sdk macosx metal -c ${METAL_SRC}
+                -I ${CMAKE_SOURCE_DIR}/src
+                -o ${AIR_FILE}
+        DEPENDS ${METAL_SRC} ${CMAKE_SOURCE_DIR}/src/SharedTypes.h
         COMMENT "Compiling Metal shaders"
     )
 

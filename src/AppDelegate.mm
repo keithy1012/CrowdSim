@@ -1,16 +1,16 @@
 #import "AppDelegate.h"
 #import <MetalKit/MetalKit.h>
 #import "Renderer.h"
-#include "Simulation.h"
+#import "GPUSimulation.h"
 
-// Increase to 10000 to benchmark Phase 1 target; lower values are smoother in Debug builds
-static constexpr uint32_t kAgentCount = 1000;
+// Phase 2 default — GPU easily handles this with O(N²); raise toward 50000 to benchmark
+static constexpr uint32_t kAgentCount = 50000;
 
 @implementation AppDelegate {
-    NSWindow   *_window;
-    MTKView    *_view;
-    Renderer   *_renderer;
-    Simulation *_sim;
+    NSWindow      *_window;
+    MTKView       *_view;
+    Renderer      *_renderer;
+    GPUSimulation *_gpuSim;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -35,19 +35,25 @@ static constexpr uint32_t kAgentCount = 1000;
         return;
     }
 
-    _sim = new Simulation(kAgentCount);
+    _view     = [[MTKView alloc] initWithFrame:frame device:device];
+    _renderer = [[Renderer alloc] initWithView:_view];
 
-    _view          = [[MTKView alloc] initWithFrame:frame device:device];
-    _renderer      = [[Renderer alloc] initWithView:_view];
-    [_renderer setSimulation:_sim];
+    // Library is loaded by Renderer; we need it here to build GPU simulation pipelines.
+    // Load from the same bundle location so both share the compiled shaders.
+    NSURL *libURL = [[NSBundle mainBundle] URLForResource:@"default" withExtension:@"metallib"];
+    NSError *err  = nil;
+    id<MTLLibrary> library = libURL ? [device newLibraryWithURL:libURL error:&err] : nil;
+    if (err) NSLog(@"[AppDelegate] Library error: %@", err);
+
+    _gpuSim = [[GPUSimulation alloc] initWithDevice:device
+                                            library:library
+                                         agentCount:kAgentCount];
+
+    [_renderer setGPUSimulation:_gpuSim];
     _view.delegate = _renderer;
 
     [_window setContentView:_view];
     [_window makeKeyAndOrderFront:nil];
-}
-
-- (void)dealloc {
-    delete _sim;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
