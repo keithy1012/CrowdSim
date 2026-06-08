@@ -97,16 +97,16 @@ Or in VS Code: `F5` to build and launch under LLDB.
 
 ## Project Outline
 
-The simulation scales through four milestones, each adding a layer of GPU acceleration:
-
-| Phase | Feature | Agent Target | Status |
+| Phase | Focus | Agent Target | Status |
 |---|---|---|---|
-| 0 | Project setup, window, render loop | — | Complete |
+| 0 | Project setup, render loop, build system | — | Complete |
 | 1 | CPU prototype, steering behaviors | 10K @ 60 FPS | Complete |
-| 2 | Metal GPU port, 4 compute passes | 50K @ 60 FPS | Next |
-| 3 | Spatial hash grid on GPU | 100K @ 60 FPS | |
-| 4 | Obstacle avoidance, scenarios | 250K @ 60 FPS | |
-| Stretch | Flow fields, ORCA, profiling dashboard | 500K+ @ 60 FPS | |
+| 2 | GPU compute port (Metal) | 50K @ 60 FPS | Next |
+| 3 | Spatial hashing + GPU neighbor search | 100K @ 60 FPS | Planned |
+| 4 | CPU vs GPU benchmarking suite | 100K+ | Planned |
+| 5 | Obstacle avoidance + crowd scenarios | 250K @ 60 FPS | Planned |
+| 6 | Flow fields and ORCA navigation | 250K+ @ 60 FPS | Planned |
+| Stretch | 500K+ agents, GPU profiling dashboard | 500K+ @ 60 FPS | Planned |
 
 ---
 
@@ -173,51 +173,146 @@ Neighbor search then checks only the agent's cell and its 8 adjacent cells — t
 
 ---
 
-## Phase 4 — Obstacle Avoidance and Scenarios
+## Phase 4 — Performance Engineering and Benchmarking
+
+**Goal:** Quantify scalability and understand performance bottlenecks.
+
+Most simulation projects stop after getting something working. CrowdSim includes a dedicated benchmarking phase to measure how different implementations scale.
+
+**Implementations compared:**
+
+*CPU — Single Thread*
+```
+Agent Update → O(N²) Neighbor Search → Steering → Integration
+```
+
+*CPU — Multi-Threaded*
+
+Workload divided across worker threads:
+```
+Thread 1 → Agents 0–9,999
+Thread 2 → Agents 10,000–19,999
+...
+```
+
+*GPU — Metal*
+
+One GPU thread per agent:
+```
+Thread 0 → Agent 0
+Thread 1 → Agent 1
+...
+```
+
+**Metrics collected:**
+
+- FPS and frame time
+- Steering pass time
+- Neighbor search time
+- GPU compute time
+- Memory consumption
+
+**Output:** Benchmark reports and scaling curves.
+
+| Agents | CPU | GPU |
+|---|---|---|
+| 10K | 60 FPS | 60 FPS |
+| 50K | 18 FPS | 60 FPS |
+| 100K | 7 FPS | 60 FPS |
+| 250K | 2 FPS | 51 FPS |
+
+**Goal:** Demonstrate measurable performance gains from GPU acceleration and algorithmic optimization.
+
+---
+
+## Phase 5 — Obstacle Avoidance and Crowd Scenarios
 
 **Goal:** Add static obstacles and build three demonstration scenarios.
 
-**Obstacle representation:** Axis-aligned line segments stored in a GPU buffer. Each segment has a start point, end point, and a normal. The obstacle buffer is uploaded once at scene load and stays on the GPU.
+**Obstacle representation:**
+
+```cpp
+struct Obstacle {
+    float2 start;
+    float2 end;
+    float2 normal;
+};
+```
+
+Static obstacles stored in a GPU buffer, uploaded once at scene load.
 
 **Avoidance in the steering pass:**
 
 ```
-For each obstacle within detection range:
-    Compute closest point on segment to agent
-    If distance < avoidanceRadius:
-        Add repulsion force along obstacle normal
+Detect obstacle
+    ↓
+Compute closest point on segment to agent
+    ↓
+Generate avoidance force along normal
+    ↓
+Adjust velocity
 ```
-
-The detection range is a compile-time constant so the shader loop is bounded.
 
 **Scenarios:**
 
-- **Stadium Evacuation** — agents distributed across a circular arena, multiple exit corridors. Measures exit throughput and congestion at bottlenecks.
-- **City Pedestrians** — grid of building obstacles, agents navigating cross-traffic flows. Demonstrates obstacle avoidance at scale.
-- **RTS Army** — two large formations moving toward each other. Demonstrates group cohesion and separation under high density.
+- **Stadium Evacuation** — large crowd exits through constrained bottlenecks. Measures throughput, congestion, and crowd density.
+- **City Pedestrians** — agents navigate around buildings and intersections. Measures traffic flow, congestion zones, and route efficiency.
+- **RTS Army** — large formations move toward objectives. Measures formation integrity, group cohesion, and scalability.
 
-**Visualization modes** (selectable at runtime):
+**Visualization modes:**
 
 | Mode | Color encoding |
 |---|---|
 | Simple | White circles |
 | Velocity | Hue maps to speed |
 | Density | Red = high local density |
-| Flow | Arrow per agent showing direction |
+| Flow | Direction vectors per agent |
 
 **Target:** 250,000 agents at 60 FPS.
 
 ---
 
-## Stretch Goal — Scale, Flow Fields, and Profiling
+## Phase 6 — Advanced Crowd Navigation
 
-**500K+ agents at 60 FPS.**
+**Goal:** Replace simple steering with techniques used in modern games, robotics, and crowd simulation research.
 
-**Flow fields** replace per-agent goal-seeking with a global vector field precomputed over the grid. Each agent samples the nearest field cell to get its desired direction. Cost is O(1) per agent at query time, and the field can be computed once for static goals.
+**Flow fields** replace per-agent goal-seeking with a global vector field precomputed over the grid:
 
-**ORCA (Optimal Reciprocal Collision Avoidance)** replaces the separation/alignment heuristics with a provably deadlock-free velocity obstacle formulation. Each agent solves a small linear program to find the closest velocity that avoids all neighbors within a time horizon.
+```
+Destination
+    ↓
+Global Vector Field
+    ↓
+Thousands of Agents sample nearest cell → O(1) path lookup
+```
 
-**GPU profiling overlay** rendered on top of the simulation:
+Benefits: extremely scalable, common in RTS games, no per-agent pathfinding cost.
+
+**ORCA (Optimal Reciprocal Collision Avoidance)** replaces heuristic separation with predictive collision avoidance:
+
+```
+Predict future collisions
+    ↓
+Construct velocity constraints (half-planes)
+    ↓
+Solve local linear program
+    ↓
+Select closest collision-free velocity
+```
+
+Benefits: deadlock reduction, more realistic crowd movement, robotics-grade navigation.
+
+**Goal:** Demonstrate advanced multi-agent navigation beyond traditional boids-style steering.
+
+---
+
+## Stretch Goal — Massive Scale and Profiling
+
+**Target: 500K+ agents at 60 FPS.**
+
+Focus areas: memory bandwidth, GPU occupancy, workgroup sizing, cache efficiency.
+
+**GPU profiling overlay:**
 
 ```
 FPS            | 60
@@ -231,7 +326,9 @@ Compute time   | 11.2 ms
 Render time    |  4.1 ms
 ```
 
-Timing is captured with `MTLCommandBuffer` completion handlers and a ring buffer of frame samples.
+Timing captured with `MTLCommandBuffer` completion handlers and a ring buffer of frame samples.
+
+**Long-term goal:** Build a simulation engine combining parallel computing, GPU programming, performance engineering, AI navigation, real-time rendering, and large-scale systems optimization.
 
 ---
 
