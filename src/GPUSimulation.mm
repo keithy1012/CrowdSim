@@ -49,18 +49,20 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
     int      _frameIndex;
 }
 
-@synthesize agentCount = _agentCount;
-@synthesize posXBuffer = _posX;
-@synthesize posYBuffer = _posY;
-@synthesize radBuffer  = _radBuffer;
+@synthesize agentCount      = _agentCount;
+@synthesize posXBuffer      = _posX;
+@synthesize posYBuffer      = _posY;
+@synthesize radBuffer       = _radBuffer;
+@synthesize useGridSteering = _useGridSteering;
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device
                        library:(id<MTLLibrary>)library
                     agentCount:(uint32_t)count {
     self = [super init];
     if (!self) return nil;
-    _device     = device;
-    _agentCount = count;
+    _device          = device;
+    _agentCount      = count;
+    _useGridSteering = YES;
     [self buildPipelines:library];
     [self allocateAndInitBuffers];
     return self;
@@ -170,108 +172,127 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
 // ── Per-frame encode ──────────────────────────────────────────────────────────
 
 - (void)encodeToCommandBuffer:(id<MTLCommandBuffer>)cmd dt:(float)dt {
-    if (!_steerGridPipeline || !_integratePipeline) return;
+    if (!_integratePipeline) return;
 
     SimParams *p  = (SimParams *)_params.contents;
     p->dt         = dt;
     p->frameIndex = _frameIndex++;
 
     MTLSize agentGrid = MTLSizeMake(_agentCount, 1, 1);
-    MTLSize cellGrid  = MTLSizeMake(kNumCells,   1, 1);
-    MTLSize prefGrid  = MTLSizeMake(1, 1, 1);
     MTLSize tg64      = MTLSizeMake(64, 1, 1);
-    MTLSize tg1       = MTLSizeMake(1,  1, 1);
 
-    // Pass 1 — zero per-cell counters
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_clearGridPipeline];
-        [enc setBuffer:_cellCount offset:0 atIndex:0];
-        [enc setBuffer:_insertPos offset:0 atIndex:1];
-        [enc setBuffer:_params    offset:0 atIndex:2];
-        [enc dispatchThreads:cellGrid threadsPerThreadgroup:tg64];
-        [enc endEncoding];
+    if (_useGridSteering) {
+        if (!_steerGridPipeline) return;
+
+        MTLSize cellGrid = MTLSizeMake(kNumCells, 1, 1);
+        MTLSize prefGrid = MTLSizeMake(1, 1, 1);
+        MTLSize tg1      = MTLSizeMake(1, 1, 1);
+
+        // Pass 1 — zero per-cell counters
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_clearGridPipeline];
+            [enc setBuffer:_cellCount offset:0 atIndex:0];
+            [enc setBuffer:_insertPos offset:0 atIndex:1];
+            [enc setBuffer:_params    offset:0 atIndex:2];
+            [enc dispatchThreads:cellGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
+        // Pass 2 — assign cell IDs, count agents per cell
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_hashPipeline];
+            [enc setBuffer:_posX      offset:0 atIndex:0];
+            [enc setBuffer:_posY      offset:0 atIndex:1];
+            [enc setBuffer:_cellID    offset:0 atIndex:2];
+            [enc setBuffer:_cellCount offset:0 atIndex:3];
+            [enc setBuffer:_params    offset:0 atIndex:4];
+            [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
+        // Pass 3 — prefix sum → cellStart; seed insertPos (1 thread)
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_prefixSumPipeline];
+            [enc setBuffer:_cellCount  offset:0 atIndex:0];
+            [enc setBuffer:_cellStart  offset:0 atIndex:1];
+            [enc setBuffer:_insertPos  offset:0 atIndex:2];
+            [enc setBuffer:_params     offset:0 atIndex:3];
+            [enc dispatchThreads:prefGrid threadsPerThreadgroup:tg1];
+            [enc endEncoding];
+        }
+        // Pass 4 — scatter agents into sorted positions
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_scatterPipeline];
+            [enc setBuffer:_cellID           offset:0 atIndex:0];
+            [enc setBuffer:_insertPos        offset:0 atIndex:1];
+            [enc setBuffer:_sortedAgentIndex offset:0 atIndex:2];
+            [enc setBuffer:_params           offset:0 atIndex:3];
+            [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
+        // Pass 5 — gather SoA into sorted order
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_reorderPipeline];
+            [enc setBuffer:_sortedAgentIndex offset:0 atIndex:0];
+            [enc setBuffer:_posX             offset:0 atIndex:1];
+            [enc setBuffer:_posY             offset:0 atIndex:2];
+            [enc setBuffer:_velX             offset:0 atIndex:3];
+            [enc setBuffer:_velY             offset:0 atIndex:4];
+            [enc setBuffer:_maxSpeed         offset:0 atIndex:5];
+            [enc setBuffer:_sPosX            offset:0 atIndex:6];
+            [enc setBuffer:_sPosY            offset:0 atIndex:7];
+            [enc setBuffer:_sVelX            offset:0 atIndex:8];
+            [enc setBuffer:_sVelY            offset:0 atIndex:9];
+            [enc setBuffer:_sMaxSpeed        offset:0 atIndex:10];
+            [enc setBuffer:_params           offset:0 atIndex:11];
+            [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
+        // Pass 6 — grid steering (sequential reads via sorted SoA)
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_steerGridPipeline];
+            [enc setBuffer:_sPosX            offset:0 atIndex:0];
+            [enc setBuffer:_sPosY            offset:0 atIndex:1];
+            [enc setBuffer:_sVelX            offset:0 atIndex:2];
+            [enc setBuffer:_sVelY            offset:0 atIndex:3];
+            [enc setBuffer:_sMaxSpeed        offset:0 atIndex:4];
+            [enc setBuffer:_targetX          offset:0 atIndex:5];
+            [enc setBuffer:_targetY          offset:0 atIndex:6];
+            [enc setBuffer:_forceX           offset:0 atIndex:7];
+            [enc setBuffer:_forceY           offset:0 atIndex:8];
+            [enc setBuffer:_cellStart        offset:0 atIndex:9];
+            [enc setBuffer:_cellCount        offset:0 atIndex:10];
+            [enc setBuffer:_sortedAgentIndex offset:0 atIndex:11];
+            [enc setBuffer:_params           offset:0 atIndex:12];
+            [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
+    } else {
+        // Phase 2 O(N²) path — used by Phase 4 benchmark for comparison
+        if (!_steerPipeline) return;
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:_steerPipeline];
+            [enc setBuffer:_posX     offset:0 atIndex:0];
+            [enc setBuffer:_posY     offset:0 atIndex:1];
+            [enc setBuffer:_velX     offset:0 atIndex:2];
+            [enc setBuffer:_velY     offset:0 atIndex:3];
+            [enc setBuffer:_targetX  offset:0 atIndex:4];
+            [enc setBuffer:_targetY  offset:0 atIndex:5];
+            [enc setBuffer:_maxSpeed offset:0 atIndex:6];
+            [enc setBuffer:_forceX   offset:0 atIndex:7];
+            [enc setBuffer:_forceY   offset:0 atIndex:8];
+            [enc setBuffer:_params   offset:0 atIndex:9];
+            [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+            [enc endEncoding];
+        }
     }
 
-    // Pass 2 — assign cell IDs, count agents per cell
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_hashPipeline];
-        [enc setBuffer:_posX      offset:0 atIndex:0];
-        [enc setBuffer:_posY      offset:0 atIndex:1];
-        [enc setBuffer:_cellID    offset:0 atIndex:2];
-        [enc setBuffer:_cellCount offset:0 atIndex:3];
-        [enc setBuffer:_params    offset:0 atIndex:4];
-        [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
-        [enc endEncoding];
-    }
-
-    // Pass 3 — prefix sum → cellStart; seed insertPos for scatter (1 thread)
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_prefixSumPipeline];
-        [enc setBuffer:_cellCount  offset:0 atIndex:0];
-        [enc setBuffer:_cellStart  offset:0 atIndex:1];
-        [enc setBuffer:_insertPos  offset:0 atIndex:2];
-        [enc setBuffer:_params     offset:0 atIndex:3];
-        [enc dispatchThreads:prefGrid threadsPerThreadgroup:tg1];
-        [enc endEncoding];
-    }
-
-    // Pass 4 — scatter agents into sorted positions
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_scatterPipeline];
-        [enc setBuffer:_cellID           offset:0 atIndex:0];
-        [enc setBuffer:_insertPos        offset:0 atIndex:1];
-        [enc setBuffer:_sortedAgentIndex offset:0 atIndex:2];
-        [enc setBuffer:_params           offset:0 atIndex:3];
-        [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
-        [enc endEncoding];
-    }
-
-    // Pass 5 — gather posX/Y/velX/Y into sorted order for cache-friendly steer reads
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_reorderPipeline];
-        [enc setBuffer:_sortedAgentIndex offset:0 atIndex:0];
-        [enc setBuffer:_posX             offset:0 atIndex:1];
-        [enc setBuffer:_posY             offset:0 atIndex:2];
-        [enc setBuffer:_velX             offset:0 atIndex:3];
-        [enc setBuffer:_velY             offset:0 atIndex:4];
-        [enc setBuffer:_maxSpeed         offset:0 atIndex:5];
-        [enc setBuffer:_sPosX            offset:0 atIndex:6];
-        [enc setBuffer:_sPosY            offset:0 atIndex:7];
-        [enc setBuffer:_sVelX            offset:0 atIndex:8];
-        [enc setBuffer:_sVelY            offset:0 atIndex:9];
-        [enc setBuffer:_sMaxSpeed        offset:0 atIndex:10];
-        [enc setBuffer:_params           offset:0 atIndex:11];
-        [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
-        [enc endEncoding];
-    }
-
-    // Pass 6 — steering; gid = sorted index → reads sPosX/Y/sVelX/Y sequentially
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_steerGridPipeline];
-        [enc setBuffer:_sPosX            offset:0 atIndex:0];
-        [enc setBuffer:_sPosY            offset:0 atIndex:1];
-        [enc setBuffer:_sVelX            offset:0 atIndex:2];
-        [enc setBuffer:_sVelY            offset:0 atIndex:3];
-        [enc setBuffer:_sMaxSpeed        offset:0 atIndex:4];
-        [enc setBuffer:_targetX          offset:0 atIndex:5];
-        [enc setBuffer:_targetY          offset:0 atIndex:6];
-        [enc setBuffer:_forceX           offset:0 atIndex:7];
-        [enc setBuffer:_forceY           offset:0 atIndex:8];
-        [enc setBuffer:_cellStart        offset:0 atIndex:9];
-        [enc setBuffer:_cellCount        offset:0 atIndex:10];
-        [enc setBuffer:_sortedAgentIndex offset:0 atIndex:11];
-        [enc setBuffer:_params           offset:0 atIndex:12];
-        [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
-        [enc endEncoding];
-    }
-
-    // Pass 7 — integration (unchanged from Phase 2)
+    // Final pass — integration (same for both paths)
     {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:_integratePipeline];

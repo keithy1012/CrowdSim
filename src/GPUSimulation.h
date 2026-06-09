@@ -3,10 +3,12 @@
 
 @interface GPUSimulation : NSObject
 
-@property (nonatomic, readonly) uint32_t      agentCount;
-@property (nonatomic, readonly) id<MTLBuffer> posXBuffer;
-@property (nonatomic, readonly) id<MTLBuffer> posYBuffer;
-@property (nonatomic, readonly) id<MTLBuffer> radBuffer;
+@property (nonatomic, readonly)  uint32_t      agentCount;
+@property (nonatomic, readonly)  id<MTLBuffer> posXBuffer;
+@property (nonatomic, readonly)  id<MTLBuffer> posYBuffer;
+@property (nonatomic, readonly)  id<MTLBuffer> radBuffer;
+// NO = Phase 2 O(N²) path (k_steer); YES = Phase 3 spatial hash path (default)
+@property (nonatomic)            BOOL          useGridSteering;
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device
                        library:(id<MTLLibrary>)library

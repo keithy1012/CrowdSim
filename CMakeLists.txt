@@ -18,6 +18,7 @@ set(SOURCES
     src/Renderer.mm
     src/Simulation.cpp
     src/GPUSimulation.mm
+    src/Benchmark.mm
 )
 
 add_executable(CrowdSim MACOSX_BUNDLE ${SOURCES})

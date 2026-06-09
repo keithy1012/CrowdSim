@@ -1,11 +1,15 @@
 #include "Simulation.h"
 #include <cmath>
 #include <algorithm>
+#include <thread>
 
 static constexpr float kWeightSeek   = 1.0f;
 static constexpr float kWeightSep    = 2.0f;
 static constexpr float kWeightAlign  = 0.4f;
 static constexpr float kWeightCohere = 0.2f;
+
+// Each thread has its own RNG so randomizeTarget is race-free in the MT path.
+static thread_local std::mt19937 s_tlRng(std::random_device{}());
 
 Simulation::Simulation(uint32_t agentCount) : _rng(42) {
     _agents.resize(agentCount);
@@ -28,29 +32,30 @@ Simulation::Simulation(uint32_t agentCount) : _rng(42) {
 void Simulation::randomizeTarget(uint32_t i) {
     std::uniform_real_distribution<float> rx(0.f, kWorldWidth);
     std::uniform_real_distribution<float> ry(0.f, kWorldHeight);
-    _agents.targetX[i] = rx(_rng);
-    _agents.targetY[i] = ry(_rng);
+    _agents.targetX[i] = rx(s_tlRng);
+    _agents.targetY[i] = ry(s_tlRng);
 }
 
-void Simulation::update(float dt) {
-    const uint32_t n   = _agents.count();
-    const float    nr2 = kNeighborRadius  * kNeighborRadius;
-    const float    sr2 = kSeparationRadius * kSeparationRadius;
+// ── Private helpers ───────────────────────────────────────────────────────────
 
-    // --- Pass 1: accumulate forces (reads previous-frame state, no writes to positions/velocities) ---
-    for (uint32_t i = 0; i < n; i++) {
+void Simulation::accumulateForces(uint32_t lo, uint32_t hi) {
+    const uint32_t n   = _agents.count();
+    const float    nr2 = kNeighborRadius   * kNeighborRadius;
+    const float    sr2 = kSeparationRadius * kSeparationRadius;
+    const float    ar2 = kArrivalRadius    * kArrivalRadius;
+
+    for (uint32_t i = lo; i < hi; i++) {
         const float px = _agents.posX[i];
         const float py = _agents.posY[i];
         const float ms = _agents.maxSpeed[i];
 
         float forceX = 0.f, forceY = 0.f;
 
-        // Goal seeking
         float gdx = _agents.targetX[i] - px;
         float gdy = _agents.targetY[i] - py;
         float gd2 = gdx * gdx + gdy * gdy;
 
-        if (gd2 < kArrivalRadius * kArrivalRadius) {
+        if (gd2 < ar2) {
             randomizeTarget(i);
         } else {
             float inv = ms / std::sqrt(gd2);
@@ -58,7 +63,6 @@ void Simulation::update(float dt) {
             forceY += kWeightSeek * gdy * inv;
         }
 
-        // Neighborhood scan (O(N²))
         float sepX = 0.f, sepY = 0.f;
         float aliVX = 0.f, aliVY = 0.f;
         float cohX = 0.f, cohY = 0.f;
@@ -73,7 +77,6 @@ void Simulation::update(float dt) {
 
             float nd = std::sqrt(nd2);
 
-            // Separation — inversely proportional to distance
             if (nd2 < sr2 && nd > 0.001f) {
                 float strength = (kSeparationRadius - nd) / kSeparationRadius;
                 sepX -= (dx / nd) * strength;
@@ -92,12 +95,9 @@ void Simulation::update(float dt) {
 
         if (count > 0) {
             float inv = 1.f / count;
-
-            // Alignment: match average neighbor velocity
             forceX += kWeightAlign * aliVX * inv;
             forceY += kWeightAlign * aliVY * inv;
 
-            // Cohesion: steer toward centroid
             float cdx = cohX * inv - px;
             float cdy = cohY * inv - py;
             float cd  = std::sqrt(cdx * cdx + cdy * cdy);
@@ -110,13 +110,13 @@ void Simulation::update(float dt) {
         _fx[i] = forceX;
         _fy[i] = forceY;
     }
+}
 
-    // --- Pass 2: integrate velocity then position ---
-    for (uint32_t i = 0; i < n; i++) {
+void Simulation::integrateSlice(uint32_t lo, uint32_t hi, float dt) {
+    for (uint32_t i = lo; i < hi; i++) {
         _agents.velX[i] += _fx[i] * dt;
         _agents.velY[i] += _fy[i] * dt;
 
-        // Clamp to max speed
         float spd = std::sqrt(_agents.velX[i] * _agents.velX[i] +
                                _agents.velY[i] * _agents.velY[i]);
         if (spd > _agents.maxSpeed[i]) {
@@ -128,8 +128,46 @@ void Simulation::update(float dt) {
         _agents.posX[i] += _agents.velX[i] * dt;
         _agents.posY[i] += _agents.velY[i] * dt;
 
-        // Wrap at world edges
         _agents.posX[i] = std::fmod(_agents.posX[i] + kWorldWidth,  kWorldWidth);
         _agents.posY[i] = std::fmod(_agents.posY[i] + kWorldHeight, kWorldHeight);
+    }
+}
+
+// ── Public update ─────────────────────────────────────────────────────────────
+
+void Simulation::update(float dt) {
+    const uint32_t n = _agents.count();
+    accumulateForces(0, n);
+    integrateSlice(0, n, dt);
+}
+
+void Simulation::update(float dt, uint32_t numThreads) {
+    if (numThreads <= 1) { update(dt); return; }
+
+    const uint32_t n         = _agents.count();
+    const uint32_t slice     = (n + numThreads - 1) / numThreads;
+
+    // Force pass — threads write to disjoint _fx/_fy ranges, all read shared posX/Y
+    {
+        std::vector<std::thread> workers;
+        for (uint32_t t = 1; t < numThreads; t++) {
+            uint32_t lo = t * slice;
+            uint32_t hi = std::min(lo + slice, n);
+            workers.emplace_back([this, lo, hi]{ accumulateForces(lo, hi); });
+        }
+        accumulateForces(0, std::min(slice, n));
+        for (auto& w : workers) w.join();
+    }
+
+    // Integrate pass — each thread owns its slice exclusively
+    {
+        std::vector<std::thread> workers;
+        for (uint32_t t = 1; t < numThreads; t++) {
+            uint32_t lo = t * slice;
+            uint32_t hi = std::min(lo + slice, n);
+            workers.emplace_back([this, lo, hi, dt]{ integrateSlice(lo, hi, dt); });
+        }
+        integrateSlice(0, std::min(slice, n), dt);
+        for (auto& w : workers) w.join();
     }
 }

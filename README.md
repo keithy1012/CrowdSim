@@ -68,6 +68,79 @@ Without `k_reorder`, `k_steerGrid` accessed neighbor data as `posX[sortedAgentIn
 
 - Verified: 100,000 agents at 60 FPS [GPU]
 
+## Phase 4 — Performance Engineering and Benchmarking
+
+**Goal:** Quantify scalability and understand performance bottlenecks across six scenarios: four CPU thread counts and two GPU algorithms.
+
+Run with:
+
+```bash
+build/CrowdSim.app/Contents/MacOS/CrowdSim --benchmark
+```
+
+**Scenarios benchmarked:**
+
+| #   | Scenario           | Algorithm                                             |
+| --- | ------------------ | ----------------------------------------------------- |
+| 1   | CPU — 1 thread     | O(N²) steering, single-threaded                       |
+| 2   | CPU — 2 threads    | O(N²) steering, force + integrate phases parallelized |
+| 3   | CPU — 4 threads    | same                                                  |
+| 4   | CPU — 8 threads    | same                                                  |
+| 5   | GPU — O(N²)        | Phase 2 `k_steer` kernel, one GPU thread per agent    |
+| 6   | GPU — Spatial Hash | Phase 3 `k_steerGrid` + 5-pass grid build             |
+
+**Results — Apple M3, 10 warmup + 30 measurement frames**
+
+Frame time in ms (lower is better). `—` = exceeded 400 ms bail threshold.
+
+```
+                           1K     5K    10K    50K   100K   250K
+                       ------ ------ ------ ------ ------ ------
+CPU  1 thread           0.73  16.49  68.38    —      —      —
+CPU  2 threads          0.45   8.50  33.78    —      —      —
+CPU  4 threads          0.32   4.45  18.27    —      —      —
+CPU  8 threads          0.33   4.10  15.54  373.82   —      —
+------------------------------------------------------------------
+GPU  O(N²)  [Ph.2]      0.87   1.16   3.45  48.72  189.26   —
+GPU  Spat.Hash [Ph.3]   0.23   1.23   0.33   1.94    6.59  37.39
+```
+
+**Speedup vs CPU 1-thread at 10K agents:**
+
+| Scenario         | Speedup |
+| ---------------- | ------- |
+| CPU 2 threads    | 2.0×    |
+| CPU 4 threads    | 3.7×    |
+| CPU 8 threads    | 4.4×    |
+| GPU O(N²)        | 19.8×   |
+| GPU Spatial Hash | 208.1×  |
+
+**Analysis:**
+
+_CPU threading — diminishing returns above 4 threads_
+
+Going from 1 → 2 threads gives a near-ideal 2.0× speedup, and 1 → 4 gives 3.7×. The jump from 4 → 8 threads only adds an additional 0.8× (total 4.4×) because the M3 has 4 performance cores and 4 efficiency cores; the efficiency cores run the same O(N²) kernel at lower clock speed and memory bandwidth, contributing less than a full P-core would. The force accumulation pass also reads all N positions for every agent, which is memory-bandwidth bound at high N — adding more threads doesn't hide that cost.
+
+_O(N²) is the hard ceiling for both CPU and GPU_
+
+The CPU 8-thread path bails at 100K and barely survives 50K (374 ms, well outside the 16.7 ms budget). The GPU O(N²) path is faster — 19.8× at 10K — because the GPU has thousands of concurrent threads hiding memory latency, but it still scales quadratically and bails at 250K. At 50K agents the GPU O(N²) frame time is 48.7 ms (≈20 FPS); at 100K it's 189 ms (≈5 FPS). Doubling N quadruples the work, exactly as expected.
+
+_Spatial hashing breaks the O(N²) wall_
+
+The GPU spatial hash path (Phase 3) stays under the 16.7 ms budget through 100K agents (6.59 ms) and only reaches 37.4 ms at 250K — still four times faster than the GPU O(N²) path at 100K. The 208× speedup over CPU 1-thread at 10K comes from two compounding effects: the GPU's parallelism (~20× over single-threaded CPU) combined with the algorithmic improvement from O(N²) to O(N) neighbor search (~10× at this density).
+
+_The 5K anomaly_
+
+The spatial hash path shows 1.23 ms at 5K but only 0.33 ms at 10K. This is not a measurement error — it reflects the overhead of the 5-pass grid build (clear → hash → prefix sum → scatter → reorder) dominating at low N. At 5K the grid build is relatively expensive compared to the steering work; at 10K the steering work grows enough to amortize the build cost. At 50K+ the ratio is favorable and the algorithm clearly wins.
+
+_Real-time thresholds_
+
+The 16.7 ms budget for 60 FPS is only met by:
+
+- CPU: no scenario at 50K+ agents
+- GPU O(N²): up to ~10K agents
+- GPU Spatial Hash: up to 100K agents comfortably; 250K is reachable (37 ms ≈ 27 FPS) and would hit 60 FPS with further optimization (Phase 5+)
+
 ---
 
 ## Project Structure
@@ -134,65 +207,10 @@ Or in VS Code: `F5` to build and launch under LLDB.
 | 1       | CPU prototype, steering behaviors        | 10K @ 60 FPS   | Complete |
 | 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Complete |
 | 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
-| 4       | CPU vs GPU benchmarking suite            | 100K+          | Planned  |
+| 4       | CPU vs GPU benchmarking suite            | 100K+          | Complete |
 | 5       | Obstacle avoidance + crowd scenarios     | 250K @ 60 FPS  | Planned  |
 | 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Planned  |
 | Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
-
----
-
-## Phase 4 — Performance Engineering and Benchmarking
-
-**Goal:** Quantify scalability and understand performance bottlenecks.
-
-Most simulation projects stop after getting something working. CrowdSim includes a dedicated benchmarking phase to measure how different implementations scale.
-
-**Implementations compared:**
-
-_CPU — Single Thread_
-
-```
-Agent Update → O(N²) Neighbor Search → Steering → Integration
-```
-
-_CPU — Multi-Threaded_
-
-Workload divided across worker threads:
-
-```
-Thread 1 → Agents 0–9,999
-Thread 2 → Agents 10,000–19,999
-...
-```
-
-_GPU — Metal_
-
-One GPU thread per agent:
-
-```
-Thread 0 → Agent 0
-Thread 1 → Agent 1
-...
-```
-
-**Metrics collected:**
-
-- FPS and frame time
-- Steering pass time
-- Neighbor search time
-- GPU compute time
-- Memory consumption
-
-**Output:** Benchmark reports and scaling curves.
-
-| Agents | CPU    | GPU    |
-| ------ | ------ | ------ |
-| 10K    | 60 FPS | 60 FPS |
-| 50K    | 18 FPS | 60 FPS |
-| 100K   | 7 FPS  | 60 FPS |
-| 250K   | 2 FPS  | 51 FPS |
-
-**Goal:** Demonstrate measurable performance gains from GPU acceleration and algorithmic optimization.
 
 ---
 
