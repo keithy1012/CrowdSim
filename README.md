@@ -68,6 +68,17 @@ Without `k_reorder`, `k_steerGrid` accessed neighbor data as `posX[sortedAgentIn
 
 - Verified: 100,000 agents at 60 FPS [GPU]
 
+**Phase 5 — Obstacle Avoidance and Crowd Scenarios (complete)**
+
+- `Obstacle` struct (`x0,y0,x1,y1`) added to `SharedTypes.h` — shared between C++ and Metal shaders
+- `GPUSimulation.loadObstacles:count:` uploads up to 64 line segments to a GPU buffer; `SimParams.obstacleCount` drives the per-frame avoidance loop
+- `k_steerGrid` extended: after flocking forces, each agent checks all obstacle segments, computes closest point on segment, and applies a 3× repulsion force within a 40 px avoidance radius
+- Three interactive scenes switchable at runtime with keys `1` / `2` / `3`: Open Field, Barrier (staggered walls forcing a zigzag), Pillars (3×2 grid of square columns)
+- Velocity colour coding: `vs_agent` reads per-agent `velX/Y` and `maxSpeed` buffers; slow agents = blue, fast = red (HSV hue sweep)
+- Obstacle lines rendered by a second pipeline (`vs_obstacle` / `fs_obstacle`) using `MTLPrimitiveTypeLine`
+- Window title updates to show the active scene name on each switch
+- Verified: 100,000 agents at 60 FPS with obstacle avoidance active [GPU]
+
 ## Phase 4 — Performance Engineering and Benchmarking
 
 **Goal:** Quantify scalability and understand performance bottlenecks across six scenarios: four CPU thread counts and two GPU algorithms.
@@ -141,6 +152,51 @@ The 16.7 ms budget for 60 FPS is only met by:
 - GPU O(N²): up to ~10K agents
 - GPU Spatial Hash: up to 100K agents comfortably; 250K is reachable (37 ms ≈ 27 FPS) and would hit 60 FPS with further optimization (Phase 5+)
 
+## Phase 5 — Obstacle Avoidance and Crowd Scenarios
+
+**Obstacle representation:** line segments stored in a GPU buffer, uploaded once at scene load via `loadObstacles:count:`.
+
+```c
+struct Obstacle {
+    float x0, y0;   // segment start
+    float x1, y1;   // segment end
+};
+```
+
+**Avoidance force** — added to `k_steerGrid` (Pass 6) after the flocking forces. For each obstacle segment, the kernel computes the closest point on the segment to the agent, then applies a repulsion force proportional to how deep into the avoidance radius the agent is:
+
+```metal
+float2 AB = B - A;
+float  t  = clamp(dot(P - A, AB) / dot(AB, AB), 0.f, 1.f);
+float2 closest  = A + t * AB;
+float2 repulse  = P - closest;
+float  dist     = length(repulse);
+if (dist < avoidR && dist > 0.001f) {
+    float strength = (avoidR - dist) / avoidR;
+    force += 3 * maxSpeed * strength * normalize(repulse);
+}
+```
+
+The weight of 3 makes obstacle avoidance override flocking and goal-seeking near walls. Avoidance radius = 40 px (less than the neighbor radius of 50 px, so it kicks in only on close approach).
+
+**Scenes** — switch with keys `1` / `2` / `3`:
+
+| Key | Scene      | Obstacles                                                                                                                  |
+| --- | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `1` | Open Field | None                                                                                                                       |
+| `2` | Barrier    | Two staggered horizontal walls. Gap on right (wall A), gap on left (wall B) — forces a zigzag path through the 100K crowd. |
+| `3` | Pillars    | Six 40×40 px square pillars (24 segments total) in a 3×2 grid — agents navigate around columns.                            |
+
+**Velocity colour coding** — `vs_agent` now reads per-agent velocity and max-speed buffers. Slow agents render blue, fast agents render red. The hue mapping is: `hue = (1 - speed) × 0.667`, giving the full blue→cyan→green→yellow→red spectrum as agents accelerate.
+
+**Obstacle line rendering** — a separate `vs_obstacle` / `fs_obstacle` pipeline renders each segment as a light-grey line using `MTLPrimitiveTypeLine`.
+
+**Freehand drawing** — left-click and drag to draw obstacles directly on the canvas. Each 12 px of mouse movement commits one line segment. Segments are appended to the active scene's preset obstacles and take effect immediately — agents start avoiding them on the next frame. Press `C` to clear all drawn segments and reset to the current scene's preset.
+
+The obstacle buffer starts at 64 segments and doubles automatically whenever it fills up (`GPUSimulation.appendObstacle:` follows the standard doubling strategy, swapping the `id<MTLBuffer>` pointer before the next encode). The practical ceiling is frame time, not memory: each agent checks every obstacle segment inside `k_steerGrid`, so drawing thousands of segments will reduce FPS proportionally.
+
+Agents are not re-spawned when scenes change.
+
 ---
 
 ## Project Structure
@@ -192,10 +248,31 @@ Or in VS Code: `Cmd+Shift+B`
 **Run**
 
 ```bash
+# Default — 100 000 agents
 open build/CrowdSim.app
+
+# Custom agent count — run the binary directly (open does not forward flags)
+build/CrowdSim.app/Contents/MacOS/CrowdSim --agents 250000
+build/CrowdSim.app/Contents/MacOS/CrowdSim --agents 10000
 ```
 
-Or in VS Code: `F5` to build and launch under LLDB.
+Or in VS Code: `F5` to build and launch under LLDB (edit `launch.json` `args` to pass `--agents`).
+
+**Benchmark suite**
+
+```bash
+build/CrowdSim.app/Contents/MacOS/CrowdSim --benchmark
+```
+
+Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 6 agent counts and prints a formatted results table.
+
+**Controls**
+
+| Input | Action |
+| ----- | ------ |
+| `1` / `2` / `3` | Switch scene (Open Field / Barrier / Pillars) — also clears drawn obstacles |
+| Left-click drag | Draw obstacle segments freehand; agents avoid them immediately |
+| `C` | Clear drawn segments, restore current scene's preset obstacles |
 
 ---
 
@@ -208,56 +285,9 @@ Or in VS Code: `F5` to build and launch under LLDB.
 | 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Complete |
 | 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
 | 4       | CPU vs GPU benchmarking suite            | 100K+          | Complete |
-| 5       | Obstacle avoidance + crowd scenarios     | 250K @ 60 FPS  | Planned  |
+| 5       | Obstacle avoidance + crowd scenarios     | 100K @ 60 FPS  | Complete |
 | 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Planned  |
 | Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
-
----
-
-## Phase 5 — Obstacle Avoidance and Crowd Scenarios
-
-**Goal:** Add static obstacles and build three demonstration scenarios.
-
-**Obstacle representation:**
-
-```cpp
-struct Obstacle {
-    float2 start;
-    float2 end;
-    float2 normal;
-};
-```
-
-Static obstacles stored in a GPU buffer, uploaded once at scene load.
-
-**Avoidance in the steering pass:**
-
-```
-Detect obstacle
-    ↓
-Compute closest point on segment to agent
-    ↓
-Generate avoidance force along normal
-    ↓
-Adjust velocity
-```
-
-**Scenarios:**
-
-- **Stadium Evacuation** — large crowd exits through constrained bottlenecks. Measures throughput, congestion, and crowd density.
-- **City Pedestrians** — agents navigate around buildings and intersections. Measures traffic flow, congestion zones, and route efficiency.
-- **RTS Army** — large formations move toward objectives. Measures formation integrity, group cohesion, and scalability.
-
-**Visualization modes:**
-
-| Mode     | Color encoding              |
-| -------- | --------------------------- |
-| Simple   | White circles               |
-| Velocity | Hue maps to speed           |
-| Density  | Red = high local density    |
-| Flow     | Direction vectors per agent |
-
-**Target:** 250,000 agents at 60 FPS.
 
 ---
 
@@ -323,7 +353,7 @@ Timing captured with `MTLCommandBuffer` completion handlers and a ring buffer of
 
 ## Stretch Goal 2 - Stadium / Building Evacuation Safety Simulator
 
-- Allow user to build out 2D or 3D map with obstacle walls, set target entry/exit points, and let the simulation run with X agents.
+- Allow user to build out 2D maps with obstacle walls, set target entry/exit points, and let the simulation run with X agents. To get 3D representation, they can build multiple 2D laers
 
 ---
 

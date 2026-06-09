@@ -36,6 +36,15 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app      = [NSApplication sharedApplication];
         AppDelegate   *delegate = [[AppDelegate alloc] init];
+
+        for (int i = 1; i + 1 < argc; i++) {
+            if (strcmp(argv[i], "--agents") == 0) {
+                int n = atoi(argv[i + 1]);
+                if (n > 0) delegate.agentCount = (uint32_t)n;
+                break;
+            }
+        }
+
         [app setDelegate:delegate];
         [app run];
     }

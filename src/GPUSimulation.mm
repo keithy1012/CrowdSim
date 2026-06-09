@@ -8,6 +8,7 @@
 static const int kGridWidth  = 26;  // ceil(1280 / 50)
 static const int kGridHeight = 15;  // ceil( 720 / 50)
 static const int kNumCells   = kGridWidth * kGridHeight; // 390
+static const uint32_t kInitialObstacleCapacity = 64;
 
 @implementation GPUSimulation {
     id<MTLDevice>               _device;
@@ -45,14 +46,24 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
     id<MTLBuffer> _sVelX, _sVelY;    // float[N]:  velocities in sorted order
     id<MTLBuffer> _sMaxSpeed;        // float[N]:  max speeds in sorted order
 
+    // Phase 5 — static obstacle line segments (dynamic buffer, doubles when full)
+    id<MTLBuffer> _obstacleBuffer;
+    uint32_t      _obstacleCapacity;
+
     uint32_t _agentCount;
+    uint32_t _obstacleCount;
     int      _frameIndex;
 }
 
 @synthesize agentCount      = _agentCount;
+@synthesize obstacleCount   = _obstacleCount;
 @synthesize posXBuffer      = _posX;
 @synthesize posYBuffer      = _posY;
 @synthesize radBuffer       = _radBuffer;
+@synthesize velXBuffer      = _velX;
+@synthesize velYBuffer      = _velY;
+@synthesize maxSpeedBuffer  = _maxSpeed;
+@synthesize obstacleBuffer  = _obstacleBuffer;
 @synthesize useGridSteering = _useGridSteering;
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device
@@ -128,6 +139,10 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
     _sVelY     = [self sharedBuf:floatSz];
     _sMaxSpeed = [self sharedBuf:floatSz];
 
+    _obstacleCapacity = kInitialObstacleCapacity;
+    _obstacleBuffer   = [self sharedBuf:_obstacleCapacity * sizeof(struct Obstacle)];
+    _obstacleCount    = 0;
+
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> rx(0.f, Simulation::kWorldWidth);
     std::uniform_real_distribution<float> ry(0.f, Simulation::kWorldHeight);
@@ -167,6 +182,38 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
     p->gridHeight        = kGridHeight;
     p->numCells          = kNumCells;
     p->cellSize          = Simulation::kNeighborRadius;
+    p->obstacleCount        = 0;
+    p->obstacleAvoidRadius  = 40.f;
+    p->obstacleAvoidRadius2 = 40.f * 40.f;
+}
+
+// ── Obstacle loading ──────────────────────────────────────────────────────────
+
+- (void)growObstacleBufferTo:(uint32_t)needed {
+    if (needed <= _obstacleCapacity) return;
+    uint32_t cap = _obstacleCapacity;
+    while (cap < needed) cap *= 2;
+    id<MTLBuffer> newBuf = [self sharedBuf:cap * sizeof(struct Obstacle)];
+    if (_obstacleCount > 0)
+        memcpy(newBuf.contents, _obstacleBuffer.contents,
+               _obstacleCount * sizeof(struct Obstacle));
+    _obstacleBuffer   = newBuf;
+    _obstacleCapacity = cap;
+}
+
+- (void)loadObstacles:(const struct Obstacle *)obstacles count:(uint32_t)count {
+    [self growObstacleBufferTo:MAX(count, 1u)];
+    if (count > 0)
+        memcpy(_obstacleBuffer.contents, obstacles, count * sizeof(struct Obstacle));
+    _obstacleCount = count;
+    ((SimParams *)_params.contents)->obstacleCount = (int)count;
+}
+
+- (void)appendObstacle:(struct Obstacle)obs {
+    [self growObstacleBufferTo:_obstacleCount + 1];
+    struct Obstacle *buf = (struct Obstacle *)_obstacleBuffer.contents;
+    buf[_obstacleCount++] = obs;
+    ((SimParams *)_params.contents)->obstacleCount = (int)_obstacleCount;
 }
 
 // ── Per-frame encode ──────────────────────────────────────────────────────────
@@ -268,6 +315,7 @@ static const int kNumCells   = kGridWidth * kGridHeight; // 390
             [enc setBuffer:_cellCount        offset:0 atIndex:10];
             [enc setBuffer:_sortedAgentIndex offset:0 atIndex:11];
             [enc setBuffer:_params           offset:0 atIndex:12];
+            [enc setBuffer:_obstacleBuffer   offset:0 atIndex:13];
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }

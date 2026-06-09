@@ -1,5 +1,11 @@
 #pragma once
 
+// Line-segment obstacle — stored in a GPU buffer for avoidance and rendered as lines.
+struct Obstacle {
+    float x0, y0;   // segment start
+    float x1, y1;   // segment end
+};
+
 // Plain-C struct — included by both C++ and Metal shaders.
 // No C++ types, no STL, no Objective-C.
 struct SimParams {
@@ -21,4 +27,8 @@ struct SimParams {
     int   gridHeight;
     int   numCells;
     float cellSize;
+    // Phase 5 — obstacle avoidance
+    int   obstacleCount;
+    float obstacleAvoidRadius;
+    float obstacleAvoidRadius2;
 };

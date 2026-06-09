@@ -16,23 +16,37 @@ static uint wang_hash(uint s) {
 
 // ── Phase 1 / 2: instanced circle rendering ───────────────────────────────────
 
+// Compact HSV → RGB; h in [0,1], s/v in [0,1]
+static float3 hsv2rgb(float h, float s, float v) {
+    float4 K = float4(1.f, 2.f / 3.f, 1.f / 3.f, 3.f);
+    float3 p = abs(fract(float3(h) + K.xyz) * 6.f - K.www);
+    return v * mix(K.xxx, clamp(p - K.xxx, 0.f, 1.f), s);
+}
+
 struct VertexOut {
     float4 position [[position]];
     float2 uv;
+    float  speed [[flat]];  // normalised [0,1]; [[flat]] = not interpolated across quad
 };
 
 // Buffer layout (matches Renderer.mm):
 //   0 — float *posX   (per-instance X)
 //   1 — float *posY   (per-instance Y)
 //   2 — float *rad    (per-instance radius)
-//   3 — float2 vp     (viewport size, same for all vertices)
+//   3 — float2 vp     (viewport size)
+//   4 — float *velX   (per-instance vel X, for speed colouring)
+//   5 — float *velY   (per-instance vel Y)
+//   6 — float *maxSpd (per-instance max speed)
 vertex VertexOut vs_agent(
-    uint               vid  [[vertex_id]],
-    uint               iid  [[instance_id]],
-    device const float *posX [[buffer(0)]],
-    device const float *posY [[buffer(1)]],
-    device const float *rad  [[buffer(2)]],
-    constant float2   &vp   [[buffer(3)]]
+    uint               vid    [[vertex_id]],
+    uint               iid    [[instance_id]],
+    device const float *posX   [[buffer(0)]],
+    device const float *posY   [[buffer(1)]],
+    device const float *rad    [[buffer(2)]],
+    constant float2   &vp     [[buffer(3)]],
+    device const float *velX   [[buffer(4)]],
+    device const float *velY   [[buffer(5)]],
+    device const float *maxSpd [[buffer(6)]]
 ) {
     float2 offsets[4] = {
         float2(-1.f, -1.f),
@@ -52,12 +66,45 @@ vertex VertexOut vs_agent(
     VertexOut out;
     out.position = float4(ndc, 0.f, 1.f);
     out.uv       = offset;
+    out.speed    = saturate(length(float2(velX[iid], velY[iid])) /
+                            max(maxSpd[iid], 0.001f));
     return out;
 }
 
+// Velocity colouring: slow → blue (hue 0.667), fast → red (hue 0)
 fragment float4 fs_agent(VertexOut in [[stage_in]]) {
     if (length(in.uv) > 1.f) discard_fragment();
-    return float4(1.f, 1.f, 1.f, 1.f);
+    float3 color = hsv2rgb((1.f - in.speed) * 0.667f, 0.85f, 1.f);
+    return float4(color, 1.f);
+}
+
+// ── Phase 5: obstacle line rendering ─────────────────────────────────────────
+
+struct ObstacleVert {
+    float4 position [[position]];
+};
+
+// Buffer layout:
+//   0 — Obstacle *obs  (x0,y0,x1,y1 per segment)
+//   1 — float2 vp
+vertex ObstacleVert vs_obstacle(
+    uint                   vid [[vertex_id]],
+    device const Obstacle *obs [[buffer(0)]],
+    constant float2       &vp  [[buffer(1)]]
+) {
+    uint seg   = vid / 2;
+    uint pt    = vid % 2;  // 0 = start, 1 = end
+    float x    = pt == 0 ? obs[seg].x0 : obs[seg].x1;
+    float y    = pt == 0 ? obs[seg].y0 : obs[seg].y1;
+    float2 ndc = float2(x, y) / vp * 2.f - 1.f;
+    ndc.y      = -ndc.y;
+    ObstacleVert out;
+    out.position = float4(ndc, 0.f, 1.f);
+    return out;
+}
+
+fragment float4 fs_obstacle(ObstacleVert in [[stage_in]]) {
+    return float4(0.85f, 0.85f, 0.85f, 1.f);
 }
 
 // ── Phase 2: GPU compute kernels ─────────────────────────────────────────────
@@ -289,7 +336,7 @@ kernel void k_reorder(
     sMaxSpeed[gid] = maxSpeed[j];
 }
 
-// Pass 6 — steering with 3×3 grid cell neighbour lookup
+// Pass 6 — steering with 3×3 grid cell neighbour lookup + obstacle avoidance
 //
 // gid = sorted position k.  Agents sorted by cellID, so threads in the same SIMD
 // group land in the same or adjacent cells and access the same sorted data → shared
@@ -300,6 +347,7 @@ kernel void k_reorder(
 //   5 targetX (rw)  6 targetY (rw)
 //   7 forceX (w)    8 forceY (w)
 //   9 cellStart (r)  10 cellCount (r)  11 sortedAgentIndex (r)  12 SimParams
+//   13 obstacles (r)
 kernel void k_steerGrid(
     device const float *sPosX            [[buffer(0)]],
     device const float *sPosY            [[buffer(1)]],
@@ -312,8 +360,9 @@ kernel void k_steerGrid(
     device float       *forceY           [[buffer(8)]],
     device const uint  *cellStart        [[buffer(9)]],
     device const uint  *cellCount        [[buffer(10)]],
-    device const uint  *sortedAgentIndex [[buffer(11)]],
-    constant SimParams &p                [[buffer(12)]],
+    device const uint     *sortedAgentIndex [[buffer(11)]],
+    constant SimParams    &p               [[buffer(12)]],
+    device const Obstacle *obstacles       [[buffer(13)]],
     uint gid [[thread_position_in_grid]]   // gid = sorted index k
 ) {
     if ((int)gid >= p.agentCount) return;
@@ -400,6 +449,24 @@ kernel void k_steerGrid(
         if (cd > 0.001f) {
             fx += p.weightCohere * (cdx / cd) * ms;
             fy += p.weightCohere * (cdy / cd) * ms;
+        }
+    }
+
+    // Obstacle avoidance — closest point on each line segment, repulsion if within radius
+    float avoidR = p.obstacleAvoidRadius;
+    for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
+        float2 A  = float2(obstacles[oi2].x0, obstacles[oi2].y0);
+        float2 B  = float2(obstacles[oi2].x1, obstacles[oi2].y1);
+        float2 AB = B - A;
+        float2 AP = float2(px, py) - A;
+        float  t  = clamp(dot(AP, AB) / dot(AB, AB), 0.f, 1.f);
+        float2 closest  = A + t * AB;
+        float2 repulse  = float2(px, py) - closest;
+        float  dist     = length(repulse);
+        if (dist < avoidR && dist > 0.001f) {
+            float strength = (avoidR - dist) / avoidR;
+            fx += 3.f * ms * strength * (repulse.x / dist);
+            fy += 3.f * ms * strength * (repulse.y / dist);
         }
     }
 
