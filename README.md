@@ -39,6 +39,35 @@ Simulates tens to hundreds of thousands of autonomous agents in real time using 
 - Instanced circle rendering via `vs_agent` / `fs_agent` Metal shaders — positions uploaded from CPU each frame
 - Verified: 1,000 agents at 60 FPS (Debug); scale `kAgentCount` in `AppDelegate.mm` to benchmark 10K
 
+**Phase 2 — Metal GPU Port (complete)**
+
+- `GPUSimulation` class manages all agent data as `MTLBuffer` SoA arrays (shared storage, CPU writes once at init)
+- `SharedTypes.h` — plain-C `SimParams` struct included by both C++ and Metal shaders
+- Two compute passes encoded per frame via separate `MTLComputeCommandEncoder` instances (ordering guarantees steer writes are visible to integrate)
+- `k_steer` kernel: O(N²) neighbour scan on GPU, goal seeking, separation/alignment/cohesion, GPU-side target reassignment via Wang hash on arrival
+- `k_integrate` kernel: velocity clamping, position integration, world-edge wrapping with `floor`-based modulo
+- `vs_agent` updated to read SoA `posX`/`posY` directly — no CPU packing step, no readback
+- CPU simulation path preserved in `Renderer` for Phase 4 benchmarking
+- Verified: 50,000 agents at 60 FPS [GPU]
+
+**Phase 3 — Spatial Hash Grid (complete)**
+
+- World divided into a 26×15 uniform grid (cellSize = neighborRadius = 50 px, 390 total cells)
+- 7 compute passes per frame: clear → hash → prefix sum → scatter → reorder → steer → integrate
+- `k_clearGrid`: zeros per-cell counters atomically before each frame
+- `k_hash`: assigns each agent to a cell, atomically counts agents per cell
+- `k_prefixSum`: exclusive prefix sum on cell counts → `cellStart[]` array (single-thread, 390 iterations)
+- `k_scatter`: places each agent into its sorted slot using per-cell atomic insert cursors
+- `k_reorder`: gathers `posX/Y`, `velX/Y`, `maxSpeed` into cell-sorted SoA buffers
+- `k_steerGrid`: iterates only the 3×3 block of cells around each agent (~2,400 candidates vs. 100,000)
+- `k_integrate`: unchanged from Phase 2
+- `SimParams` extended with `gridWidth`, `gridHeight`, `numCells`, `cellSize`
+
+**Bug encountered — cache-hostile random reads (mitigated):**
+Without `k_reorder`, `k_steerGrid` accessed neighbor data as `posX[sortedAgentIndex[k]]` — a random read scattered across the full N-element buffer for every neighbor candidate. At 100K agents this produced ~230M random memory accesses per frame, thrashing the GPU cache and dropping performance to ~10 FPS. The mitigation was adding the `k_reorder` pass, which gathers agent data into cell-sorted order before the steer pass. With sorted SoA, threads in the same SIMD group (which land in the same or adjacent cells after sorting) read sequential memory addresses and share cache lines, restoring full throughput.
+
+- Verified: 100,000 agents at 60 FPS [GPU]
+
 ---
 
 ## Project Structure
@@ -48,12 +77,14 @@ CrowdSim/
 ├── CMakeLists.txt          — Build system
 ├── src/
 │   ├── Agent.h             — SoA agent buffer layout
-│   ├── Simulation.h/.cpp   — CPU steering loop (seek, separate, align, cohere)
+│   ├── SharedTypes.h       — SimParams struct (shared by C++ and Metal)
+│   ├── Simulation.h/.cpp   — CPU steering loop (Phase 1 / Phase 4 benchmarking)
+│   ├── GPUSimulation.h/.mm — Metal buffers, k_steer + k_integrate pipelines
 │   ├── main.mm             — App entry point
-│   ├── AppDelegate.h/.mm   — Window, MTKView, and Simulation setup
-│   └── Renderer.h/.mm      — Metal pipeline, instanced draw, per-frame upload
+│   ├── AppDelegate.h/.mm   — Window, MTKView, GPUSimulation setup
+│   └── Renderer.h/.mm      — CPU + GPU render paths, instanced draw
 ├── shaders/
-│   └── Shaders.metal       — vs_agent / fs_agent (circle instancing)
+│   └── Shaders.metal       — vs_agent / fs_agent, k_steer, k_integrate
 └── .vscode/
     ├── tasks.json          — Build / Run tasks
     ├── launch.json         — LLDB debug configuration
@@ -101,75 +132,12 @@ Or in VS Code: `F5` to build and launch under LLDB.
 | ------- | ---------------------------------------- | -------------- | -------- |
 | 0       | Project setup, render loop, build system | —              | Complete |
 | 1       | CPU prototype, steering behaviors        | 10K @ 60 FPS   | Complete |
-| 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Next     |
-| 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Planned  |
+| 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Complete |
+| 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
 | 4       | CPU vs GPU benchmarking suite            | 100K+          | Planned  |
 | 5       | Obstacle avoidance + crowd scenarios     | 250K @ 60 FPS  | Planned  |
 | 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Planned  |
 | Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
-
----
-
-## Phase 2 — Metal GPU Port
-
-**Goal:** Move the entire simulation loop to the GPU. Each Metal thread owns one agent.
-
-**Four compute passes** per frame:
-
-```
-Pass 1 — Grid Build
-    Each thread: hash agent position → cell ID
-    Output: per-agent cell assignments
-
-Pass 2 — Neighbor Search
-    Each thread: scan current cell + 8 adjacent cells
-    Output: per-agent neighbor list
-
-Pass 3 — Steering Update
-    Each thread: compute goal/separation/alignment/cohesion forces
-    Output: new velocity per agent
-
-Pass 4 — Physics Integration
-    Each thread: position += velocity * deltaTime
-    Output: new position per agent
-```
-
-**GPU buffer layout** mirrors the CPU SoA arrays. All six float arrays (`posX`, `posY`, `velX`, `velY`, `targetX`, `targetY`) become `MTLBuffer` objects. Updated once on spawn; read/write entirely on the GPU each frame.
-
-**Rendering** switches to a GPU-driven instanced draw — positions are read directly from the position buffers already on the GPU, with no CPU readback.
-
-**Target:** 50,000 agents at 60 FPS.
-
----
-
-## Phase 3 — Spatial Hash Grid
-
-**Goal:** Replace O(N²) neighbor search with O(N) spatial hashing on the GPU.
-
-**Problem with Phase 2:** Pass 2 still scans all agents to find neighbors. At 50K agents that is 2.5 billion comparisons per frame.
-
-**Solution:** Uniform grid. The world is divided into fixed-size cells. Each agent is mapped to exactly one cell by hashing its position:
-
-```
-cellX = floor(posX / cellSize)
-cellY = floor(posY / cellSize)
-cellID = cellX + cellY * gridWidth
-```
-
-Neighbor search then checks only the agent's cell and its 8 adjacent cells — typically a constant number of agents regardless of total crowd size.
-
-**GPU implementation:**
-
-1. Each thread writes its agent's `cellID` into a sort key buffer
-2. GPU radix sort orders agents by cell (parallel prefix sum)
-3. A second pass builds a `cellStart[]` and `cellEnd[]` lookup table
-4. Neighbor search indexes into `cellStart[cellID]` to iterate only the relevant agents
-
-**Memory layout:** The sorted index buffer avoids moving the SoA arrays. Each thread reads `sortedIndex[i]` to access the actual agent data.
-
-**Cell size tuning:** Optimal cell size is roughly 2× the agent interaction radius — small enough to limit neighbors per cell, large enough that most agents have at least one neighbor.
-
-**Target:** 100,000 agents at 60 FPS.
 
 ---
 

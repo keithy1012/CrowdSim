@@ -196,3 +196,213 @@ kernel void k_integrate(
     posX[gid] = nx - p.worldWidth  * floor(nx / p.worldWidth);
     posY[gid] = ny - p.worldHeight * floor(ny / p.worldHeight);
 }
+
+// ── Phase 3: spatial hash grid build + O(9-cell) neighbour search ─────────────
+
+// Pass 1 — zero per-cell counters before use each frame
+kernel void k_clearGrid(
+    device atomic_uint *cellCount [[buffer(0)]],
+    device atomic_uint *insertPos [[buffer(1)]],
+    constant SimParams &p         [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.numCells) return;
+    atomic_store_explicit(&cellCount[gid], 0u, memory_order_relaxed);
+    atomic_store_explicit(&insertPos[gid], 0u, memory_order_relaxed);
+}
+
+// Pass 2 — map each agent to its cell, atomically count agents per cell
+kernel void k_hash(
+    device const float *posX      [[buffer(0)]],
+    device const float *posY      [[buffer(1)]],
+    device uint        *cellID    [[buffer(2)]],
+    device atomic_uint *cellCount [[buffer(3)]],
+    constant SimParams &p         [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+    int cx = (int)(posX[gid] / p.cellSize);
+    int cy = (int)(posY[gid] / p.cellSize);
+    cx = clamp(cx, 0, p.gridWidth  - 1);
+    cy = clamp(cy, 0, p.gridHeight - 1);
+    uint cid    = (uint)(cx + cy * p.gridWidth);
+    cellID[gid] = cid;
+    atomic_fetch_add_explicit(&cellCount[cid], 1u, memory_order_relaxed);
+}
+
+// Pass 3 — exclusive prefix sum on cellCount → cellStart; seed insertPos for scatter
+// Dispatched with exactly 1 thread; 390 iterations is negligible on GPU.
+kernel void k_prefixSum(
+    device const uint  *cellCount [[buffer(0)]],
+    device uint        *cellStart [[buffer(1)]],
+    device atomic_uint *insertPos [[buffer(2)]],
+    constant SimParams &p         [[buffer(3)]]
+) {
+    uint acc = 0;
+    for (int c = 0; c < p.numCells; c++) {
+        cellStart[c] = acc;
+        atomic_store_explicit(&insertPos[c], acc, memory_order_relaxed);
+        acc += cellCount[c];
+    }
+}
+
+// Pass 4 — scatter each agent into its sorted slot using atomic insert offsets
+kernel void k_scatter(
+    device const uint  *cellID           [[buffer(0)]],
+    device atomic_uint *insertPos        [[buffer(1)]],
+    device uint        *sortedAgentIndex [[buffer(2)]],
+    constant SimParams &p                [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+    uint cid = cellID[gid];
+    uint pos = atomic_fetch_add_explicit(&insertPos[cid], 1u, memory_order_relaxed);
+    sortedAgentIndex[pos] = gid;
+}
+
+// Pass 5 — gather agent data into sorted order so k_steerGrid reads sequentially
+//
+// Without this, k_steerGrid does posX[sortedAgentIndex[k]] — random reads across N
+// elements per neighbour candidate — causing cache misses.  With sorted SoA, threads
+// in the same SIMD group (same or adjacent cells after sort) share cache lines.
+kernel void k_reorder(
+    device const uint  *sortedAgentIndex [[buffer(0)]],
+    device const float *posX             [[buffer(1)]],
+    device const float *posY             [[buffer(2)]],
+    device const float *velX             [[buffer(3)]],
+    device const float *velY             [[buffer(4)]],
+    device const float *maxSpeed         [[buffer(5)]],
+    device float       *sPosX            [[buffer(6)]],
+    device float       *sPosY            [[buffer(7)]],
+    device float       *sVelX            [[buffer(8)]],
+    device float       *sVelY            [[buffer(9)]],
+    device float       *sMaxSpeed        [[buffer(10)]],
+    constant SimParams &p                [[buffer(11)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+    uint j         = sortedAgentIndex[gid];
+    sPosX[gid]     = posX[j];
+    sPosY[gid]     = posY[j];
+    sVelX[gid]     = velX[j];
+    sVelY[gid]     = velY[j];
+    sMaxSpeed[gid] = maxSpeed[j];
+}
+
+// Pass 6 — steering with 3×3 grid cell neighbour lookup
+//
+// gid = sorted position k.  Agents sorted by cellID, so threads in the same SIMD
+// group land in the same or adjacent cells and access the same sorted data → shared
+// cache lines, no scatter reads.
+//
+// Buffer layout:
+//   0 sPosX (r)  1 sPosY (r)  2 sVelX (r)  3 sVelY (r)  4 sMaxSpeed (r)
+//   5 targetX (rw)  6 targetY (rw)
+//   7 forceX (w)    8 forceY (w)
+//   9 cellStart (r)  10 cellCount (r)  11 sortedAgentIndex (r)  12 SimParams
+kernel void k_steerGrid(
+    device const float *sPosX            [[buffer(0)]],
+    device const float *sPosY            [[buffer(1)]],
+    device const float *sVelX            [[buffer(2)]],
+    device const float *sVelY            [[buffer(3)]],
+    device const float *sMaxSpeed        [[buffer(4)]],
+    device float       *targetX          [[buffer(5)]],
+    device float       *targetY          [[buffer(6)]],
+    device float       *forceX           [[buffer(7)]],
+    device float       *forceY           [[buffer(8)]],
+    device const uint  *cellStart        [[buffer(9)]],
+    device const uint  *cellCount        [[buffer(10)]],
+    device const uint  *sortedAgentIndex [[buffer(11)]],
+    constant SimParams &p                [[buffer(12)]],
+    uint gid [[thread_position_in_grid]]   // gid = sorted index k
+) {
+    if ((int)gid >= p.agentCount) return;
+
+    float px = sPosX[gid];
+    float py = sPosY[gid];
+    float ms = sMaxSpeed[gid];
+    uint  oi = sortedAgentIndex[gid];  // original agent index — used for target/force writes
+
+    float fx = 0.f, fy = 0.f;
+
+    // Goal seeking (target stored by original index)
+    float gdx = targetX[oi] - px;
+    float gdy = targetY[oi] - py;
+    float gd2 = gdx * gdx + gdy * gdy;
+
+    if (gd2 < p.arrivalRadius2) {
+        uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+        targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+        seed        = wang_hash(seed);
+        targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+    } else {
+        float inv = ms / sqrt(gd2);
+        fx += p.weightSeek * gdx * inv;
+        fy += p.weightSeek * gdy * inv;
+    }
+
+    // 3×3 grid neighbourhood — reads sPosX/Y/sVelX/Y sequentially within each cell
+    int agCellX = (int)(px / p.cellSize);
+    int agCellY = (int)(py / p.cellSize);
+
+    float sepX = 0.f, sepY = 0.f;
+    float aliVX = 0.f, aliVY = 0.f;
+    float cohX = 0.f, cohY = 0.f;
+    int   count = 0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        int ny = agCellY + dy;
+        if (ny < 0 || ny >= p.gridHeight) continue;
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = agCellX + dx;
+            if (nx < 0 || nx >= p.gridWidth) continue;
+
+            uint cid   = (uint)(nx + ny * p.gridWidth);
+            uint start = cellStart[cid];
+            uint end   = start + cellCount[cid];
+
+            for (uint k = start; k < end; k++) {
+                if (k == gid) continue;  // self-skip by sorted index
+
+                float ndx = sPosX[k] - px;  // sequential read
+                float ndy = sPosY[k] - py;  // sequential read
+                float nd2 = ndx * ndx + ndy * ndy;
+                if (nd2 > p.neighborRadius2) continue;
+
+                float nd = sqrt(nd2);
+
+                if (nd2 < p.separationRadius2 && nd > 0.001f) {
+                    float strength = (p.separationRadius - nd) / p.separationRadius;
+                    sepX -= (ndx / nd) * strength;
+                    sepY -= (ndy / nd) * strength;
+                }
+
+                aliVX += sVelX[k];  // sequential read
+                aliVY += sVelY[k];  // sequential read
+                cohX  += sPosX[k];  // cached
+                cohY  += sPosY[k];  // cached
+                count++;
+            }
+        }
+    }
+
+    fx += p.weightSep * sepX;
+    fy += p.weightSep * sepY;
+
+    if (count > 0) {
+        float inv = 1.f / (float)count;
+        fx += p.weightAlign * aliVX * inv;
+        fy += p.weightAlign * aliVY * inv;
+
+        float cdx = cohX * inv - px;
+        float cdy = cohY * inv - py;
+        float cd  = length(float2(cdx, cdy));
+        if (cd > 0.001f) {
+            fx += p.weightCohere * (cdx / cd) * ms;
+            fy += p.weightCohere * (cdy / cd) * ms;
+        }
+    }
+
+    forceX[oi] = fx;
+    forceY[oi] = fy;
+}

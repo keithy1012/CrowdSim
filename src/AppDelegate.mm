@@ -3,8 +3,8 @@
 #import "Renderer.h"
 #import "GPUSimulation.h"
 
-// Phase 2 default — GPU easily handles this with O(N²); raise toward 50000 to benchmark
-static constexpr uint32_t kAgentCount = 50000;
+// Phase 3 — spatial hash grid target
+static constexpr uint32_t kAgentCount = 100000;
 
 @implementation AppDelegate {
     NSWindow      *_window;

@@ -16,4 +16,9 @@ struct SimParams {
     float weightSep;
     float weightAlign;
     float weightCohere;
+    // Phase 3 — spatial hash grid
+    int   gridWidth;
+    int   gridHeight;
+    int   numCells;
+    float cellSize;
 };
