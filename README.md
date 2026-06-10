@@ -186,6 +186,136 @@ The obstacle buffer starts at 64 segments and doubles automatically whenever it 
 
 Agents are not re-spawned when scenes change.
 
+## Phase 6 — Advanced Crowd Navigation (complete)
+
+### Flow Fields
+
+Flow fields replace per-agent goal-seeking with a global vector field precomputed over the grid:
+
+```
+Destination (right-click to place)
+    ↓
+8-directional Dijkstra BFS over 26×15 grid (390 cells, 50 px each)
+    ↓
+390 normalised float2 vectors uploaded to GPU (3 KB buffer)
+    ↓
+Each agent samples flowField[cellX + cellY * gridWidth] → O(1) path lookup
+```
+
+Benefits: all 100K agents share one pathfinding computation, naturally routes around obstacles, familiar in RTS games.
+
+A white downward-pointing triangle marks the current goal. Right-click anywhere to move it; press `F` to toggle flow-field mode (agents revert to random wandering when off).
+
+Implementation: CPU-side Dijkstra runs on SimParams change via a dirty-flag batched to once per frame. Diagonal moves check both cardinal neighbours to prevent corner-cutting through walls.
+
+### ORCA (Optimal Reciprocal Collision Avoidance)
+
+ORCA replaces the heuristic separation force with mathematically optimal, deadlock-free collision avoidance. Press `O` to toggle.
+
+```
+For each agent A and each nearby agent B (spatial-hash neighbour):
+    Relative position p = B.pos − A.pos
+    Relative velocity v = A.vel − B.vel
+    Velocity obstacle VO = set of relative velocities that cause collision within τ seconds
+    ORCA half-plane: A's new velocity must lie outside ½ of VO (reciprocal responsibility)
+        ↓
+Collect up to 20 half-plane constraints
+        ↓
+2D linear program (RVO2 algorithm): find velocity closest to preferred velocity
+        that satisfies all half-plane constraints within the speed disk
+        ↓
+Write result as a force-equivalent so k_integrate yields the LP solution exactly
+```
+
+**Key properties:**
+
+- **Reciprocal**: each agent takes half the avoidance responsibility, eliminating oscillation
+- **Optimal**: the LP gives the velocity mathematically closest to the preferred direction
+- **Deadlock-free**: the LP always finds a feasible velocity (the partial solution is used on infeasibility)
+- **Composable with flow fields**: preferred velocity comes from the flow field (or direct seek); ORCA handles only local collisions
+
+**Implementation details:**
+
+- `k_orca` kernel (Pass 6) has the same buffer layout as `k_steerGrid` — toggled by `SimParams.useORCA`
+- LP helper `lp1` / `lp2` are static Metal functions; `lp2` calls `lp1` per violated constraint
+- Max 20 ORCA constraints per agent (`kMaxORCA`) — caps LP cost; excess neighbours skipped
+- Obstacle avoidance: wall repulsion pre-biases the preferred velocity before the LP, so the LP routes around walls while resolving agent-agent collisions
+- Time horizon τ = 1.5 s (configurable via `SimParams.orcaTimeHorizon`); agents begin adjusting velocity when collision is predicted within τ seconds
+- Force-equivalent write: `forceX[oi] = (newVel.x − currentVel.x) / dt`; after `k_integrate` adds `force × dt`, the velocity is exactly `newVel` with no other changes needed
+
+### Analysis
+
+_Cost model: O(N × kMaxORCA²) worst case per frame_
+
+`k_steerGrid` scans the same 3×3 spatial-hash neighbourhood but does ~10–20 float ops per neighbour (dot product, clamp, weighted accumulate). `k_orca` does the same scan and then runs the 2D LP. `lp2` iterates at most `kMaxORCA = 20` constraints; for each violated constraint it calls `lp1`, which has an inner loop over all previous constraints — worst-case O(kMaxORCA²) = 400 iterations of cheap arithmetic. In practice the LP terminates in 3–8 calls to `lp1` because most constraints are already satisfied by the preferred velocity. At 100K agents the LP overhead is ~3–4× the `k_steerGrid` steering cost, placing `k_orca` at roughly 20–25 ms on the M3 (vs. 6.6 ms for `k_steerGrid`). This sits just outside the 16.7 ms 60 FPS budget; 30 FPS is comfortable.
+
+_Lane formation — the emergent hallmark of ORCA_
+
+The most visually distinctive behaviour of ORCA is spontaneous lane formation in bidirectional flow. When agents moving left and agents moving right approach each other, the heuristic separation force pushes them apart symmetrically in all directions, causing jitter and repeated course corrections. ORCA prevents this: each agent computes the minimum velocity change to avoid every neighbour, and because the correction is reciprocal, agents converging from opposite directions independently converge on the same side-step direction. After 2–3 frames of adjustment the agents have negotiated a passing lane, and the lane persists because agents behind follow the same preferred velocity and encounter the same half-plane geometry. This emerges from the algorithm rather than being programmed directly.
+
+_Oscillation elimination_
+
+In `k_steerGrid`, two agents directly facing each other at separation-radius range apply equal and opposite forces each frame, causing them to rock back and forth without making progress. ORCA eliminates this because the LP always outputs a velocity that is on the correct side of every half-plane — the correction is a one-shot geometric solve, not an accumulating force. Once the LP solution is applied the constraint is satisfied for that frame, and the next frame's geometry is slightly different (agents have moved), so the oscillation cycle never closes.
+
+_Flow field + ORCA: global path, local avoidance_
+
+Running both together produces the most realistic behaviour. The flow field provides a single globally optimal direction to the goal, computed once on the CPU from a Dijkstra BFS. ORCA ensures agents don't pile up at bottlenecks: as the corridor narrows, agents' ORCA half-planes force them to queue and stagger rather than compress into a single cell. The combination is the canonical architecture used in modern game engines for large crowds: a coarse global planner (flow field, navigation mesh, hierarchical pathfinding) gives the preferred velocity, and a fine local avoidance layer (ORCA, RVO) removes collisions frame by frame.
+
+_Known limitations_
+
+Three simplifications were made for this phase:
+
+1. **No `linearProgram3`**: when more than `kMaxORCA` constraints exist (extreme density), `lp2` returns a partial solution — a velocity that satisfies the first N constraints but not necessarily all of them. The full RVO2 algorithm adds a third pass (`lp3`) that minimises the maximum penetration depth across all unsatisfied constraints. Omitting it means agents in very dense packing can briefly overlap; adding `lp3` is a straightforward O(kMaxORCA) extension.
+
+2. **Force-based obstacle ORCA**: proper ORCA uses dedicated half-plane constraints for static line segments (treating each segment as a zero-velocity agent with infinite mass). Here, wall repulsion is applied as a pre-bias to the preferred velocity before the LP runs. This is simpler and works well at low-to-medium density but can fail when agents are simultaneously pressed against a wall and surrounded by neighbours — the LP may choose a velocity that satisfies all agent constraints but points into the wall.
+
+3. **Fixed combined radius**: all agents have radius 5 px, so `combinedR = 10 px` is hardcoded in the kernel. Supporting heterogeneous radii requires adding a sorted-radius SoA buffer (`sRad`) to the reorder pass and passing it to `k_orca` — a one-pass change with no algorithmic impact.
+
+### Threadgroup Memory Tiling
+
+Both `k_steerGrid` and `k_orca` use the same **cooperative-load tiling** pattern adapted from CUDA shared memory:
+
+**The problem without tiling:**
+
+At 100K agents with 256 agents/cell, the 3×3 neighbourhood contains ~2,300 agents. All 64 threads in a threadgroup process consecutive sorted agents that land in the same cell, so they all scan the same ~2,300 neighbors. Each thread independently reads those 2,300 × 5 floats (posX, posY, velX, velY, maxSpeed) from device (global) memory:
+
+```
+64 threads × 2,300 neighbours × 5 floats × 4 bytes = ~2.9 MB of global reads per threadgroup
+```
+
+**What tiling does:**
+
+Threads cooperatively load 64 agents at a time into **threadgroup memory** (on-chip SRAM, ~1–2 TB/s bandwidth on M-series vs. ~100–200 GB/s for device memory). Each 64-agent tile requires only 64 loads from global memory — one per thread — and all 64 threads then read from the fast TGSM:
+
+```
+2,300 neighbours × 5 floats × 4 bytes = ~46 KB of global reads per threadgroup  (64× fewer)
++ 64 threads × 2,300 fast TGSM reads
+```
+
+**Barrier uniformity:**
+
+The standard CUDA pitfall is barrier divergence: if different threads in the same threadgroup enter different numbers of tile iterations, the `threadgroup_barrier` calls become unmatched and execution hangs. This is solved by broadcasting thread-0's cell coordinates to all threads at the start of the kernel. Since all threads use the same reference cell, they visit the same 9 cells and the same tile boundaries, executing every barrier in lockstep.
+
+```metal
+// All 64 threads use the same cell reference → same tile loop count → safe barriers
+if (lid == 0) { tgRefX[0] = agCellX; tgRefY[0] = agCellY; }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+int refCellX = tgRefX[0];  // all threads read the same value
+```
+
+**When the approximation kicks in:**
+
+At low agent counts (< ~25K), cells have fewer than 64 agents and a threadgroup may span 2 cells. Thread 0's reference cell may differ from a boundary thread's actual cell, so the boundary thread scans thread 0's 3×3 neighborhood instead of its own. The distance check still rejects truly out-of-range agents (correctness is preserved); only a few distant neighbors in the non-reference cells are missed. At 100K agents this never occurs.
+
+**Threadgroup memory footprint:**
+
+| Kernel        | Arrays                   | Size per threadgroup |
+| ------------- | ------------------------ | -------------------- |
+| `k_steerGrid` | posX/Y + velX/Y + maxSpd | 1,288 B              |
+| `k_orca`      | posX/Y + velX/Y          | 1,032 B              |
+
+Both are well under the 32 KB Metal threadgroup memory limit, leaving headroom for the compiler to allocate additional TGSM for other variables.
+
 ---
 
 ## Project Structure
@@ -280,63 +410,6 @@ Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 
 | 5       | Obstacle avoidance + crowd scenarios     | 100K @ 60 FPS  | Complete |
 | 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Complete |
 | Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
-
----
-
-## Phase 6 — Advanced Crowd Navigation (complete)
-
-### Flow Fields
-
-Flow fields replace per-agent goal-seeking with a global vector field precomputed over the grid:
-
-```
-Destination (right-click to place)
-    ↓
-8-directional Dijkstra BFS over 26×15 grid (390 cells, 50 px each)
-    ↓
-390 normalised float2 vectors uploaded to GPU (3 KB buffer)
-    ↓
-Each agent samples flowField[cellX + cellY * gridWidth] → O(1) path lookup
-```
-
-Benefits: all 100K agents share one pathfinding computation, naturally routes around obstacles, familiar in RTS games.
-
-A white downward-pointing triangle marks the current goal. Right-click anywhere to move it; press `F` to toggle flow-field mode (agents revert to random wandering when off).
-
-Implementation: CPU-side Dijkstra runs on SimParams change via a dirty-flag batched to once per frame. Diagonal moves check both cardinal neighbours to prevent corner-cutting through walls.
-
-### ORCA (Optimal Reciprocal Collision Avoidance)
-
-ORCA replaces the heuristic separation force with mathematically optimal, deadlock-free collision avoidance. Press `O` to toggle.
-
-```
-For each agent A and each nearby agent B (spatial-hash neighbour):
-    Relative position p = B.pos − A.pos
-    Relative velocity v = A.vel − B.vel
-    Velocity obstacle VO = set of relative velocities that cause collision within τ seconds
-    ORCA half-plane: A's new velocity must lie outside ½ of VO (reciprocal responsibility)
-        ↓
-Collect up to 20 half-plane constraints
-        ↓
-2D linear program (RVO2 algorithm): find velocity closest to preferred velocity
-        that satisfies all half-plane constraints within the speed disk
-        ↓
-Write result as a force-equivalent so k_integrate yields the LP solution exactly
-```
-
-**Key properties:**
-- **Reciprocal**: each agent takes half the avoidance responsibility, eliminating oscillation
-- **Optimal**: the LP gives the velocity mathematically closest to the preferred direction
-- **Deadlock-free**: the LP always finds a feasible velocity (the partial solution is used on infeasibility)
-- **Composable with flow fields**: preferred velocity comes from the flow field (or direct seek); ORCA handles only local collisions
-
-**Implementation details:**
-- `k_orca` kernel (Pass 6) has the same buffer layout as `k_steerGrid` — toggled by `SimParams.useORCA`
-- LP helper `lp1` / `lp2` are static Metal functions; `lp2` calls `lp1` per violated constraint
-- Max 20 ORCA constraints per agent (`kMaxORCA`) — caps LP cost; excess neighbours skipped
-- Obstacle avoidance: wall repulsion pre-biases the preferred velocity before the LP, so the LP routes around walls while resolving agent-agent collisions
-- Time horizon τ = 1.5 s (configurable via `SimParams.orcaTimeHorizon`); agents begin adjusting velocity when collision is predicted within τ seconds
-- Force-equivalent write: `forceX[oi] = (newVel.x − currentVel.x) / dt`; after `k_integrate` adds `force × dt`, the velocity is exactly `newVel` with no other changes needed
 
 ---
 

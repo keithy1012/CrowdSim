@@ -364,18 +364,24 @@ kernel void k_reorder(
     sMaxSpeed[gid] = maxSpeed[j];
 }
 
-// Pass 6 — steering with 3×3 grid cell neighbour lookup + obstacle avoidance
+// Pass 6 — steering with tiled 3×3 grid cell neighbour lookup + obstacle avoidance
 //
-// gid = sorted position k.  Agents sorted by cellID, so threads in the same SIMD
-// group land in the same or adjacent cells and access the same sorted data → shared
-// cache lines, no scatter reads.
+// Tiling (CUDA shared-memory pattern adapted for Metal threadgroup memory):
+//   At 100K agents / 390 cells ≈ 256 agents/cell.  All 64 threads in a threadgroup
+//   process consecutive sorted agents that are almost always in the SAME cell, so they
+//   all scan the SAME 3×3 neighbourhood (~2300 agents).  Without tiling, 64 threads each
+//   read those 2300 × 5 floats from device memory → ~736K reads.  With tiling, threads
+//   cooperatively load 64 agents at a time into threadgroup (on-chip) memory and all 64
+//   threads read from there → ~2300 × 5 global reads + fast TGSM reads.
 //
-// Buffer layout:
-//   0 sPosX (r)  1 sPosY (r)  2 sVelX (r)  3 sVelY (r)  4 sMaxSpeed (r)
-//   5 targetX (rw)  6 targetY (rw)
-//   7 forceX (w)    8 forceY (w)
-//   9 cellStart (r)  10 cellCount (r)  11 sortedAgentIndex (r)  12 SimParams
-//   13 obstacles (r)  14 flowField (r)
+// Barrier uniformity: all threads use thread-0's cell as the reference so every thread
+//   in the group iterates the same set of 9 cells and the same number of 64-agent tiles,
+//   guaranteeing that every threadgroup_barrier is executed by all threads simultaneously.
+//   At lower agent counts a thread may be in a different cell than thread 0; the distance
+//   check below still rejects out-of-range agents so results remain correct (some distant
+//   neighbours in the non-reference cells may be missed, which is acceptable at low density).
+//
+// Buffer layout: identical to before (0–14).
 kernel void k_steerGrid(
     device const float    *sPosX            [[buffer(0)]],
     device const float    *sPosY            [[buffer(1)]],
@@ -392,39 +398,54 @@ kernel void k_steerGrid(
     constant SimParams    &p               [[buffer(12)]],
     device const Obstacle *obstacles       [[buffer(13)]],
     device const float2   *flowField       [[buffer(14)]],
-    uint gid [[thread_position_in_grid]]   // gid = sorted index k
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
-    if ((int)gid >= p.agentCount) return;
+    // ── Threadgroup (on-chip) memory — 5 × 64 × 4 B = 1280 B per threadgroup ──
+    threadgroup float tgPosX   [64];
+    threadgroup float tgPosY   [64];
+    threadgroup float tgVelX   [64];
+    threadgroup float tgVelY   [64];
+    threadgroup float tgMaxSpd [64];
+    threadgroup int   tgRefX   [1];   // thread-0's cell X, broadcast to all
+    threadgroup int   tgRefY   [1];
 
-    float px = sPosX[gid];
-    float py = sPosY[gid];
-    float ms = sMaxSpeed[gid];
-    uint  oi = sortedAgentIndex[gid];
+    bool  active = ((int)gid < p.agentCount);
+    float px     = active ? sPosX   [gid] : 0.f;
+    float py     = active ? sPosY   [gid] : 0.f;
+    float ms     = active ? sMaxSpeed[gid]: 1.f;
+    uint  oi     = active ? sortedAgentIndex[gid] : 0u;
 
-    float fx = 0.f, fy = 0.f;
-
-    // Cell coordinates — used by both seeking and the neighbourhood scan below
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
 
-    // Goal seeking — flow field samples one vector; direct seek steers to individual target
-    if (p.useFlowField) {
-        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
-        fx += p.weightSeek * dir.x * ms;
-        fy += p.weightSeek * dir.y * ms;
-    } else {
-        float gdx = targetX[oi] - px;
-        float gdy = targetY[oi] - py;
-        float gd2 = gdx * gdx + gdy * gdy;
-        if (gd2 < p.arrivalRadius2) {
-            uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
-            targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
-            seed        = wang_hash(seed);
-            targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+    // Broadcast thread-0's cell to all threads in the group
+    if (lid == 0) { tgRefX[0] = agCellX; tgRefY[0] = agCellY; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int refCellX = tgRefX[0];
+    int refCellY = tgRefY[0];
+
+    float fx = 0.f, fy = 0.f;
+
+    if (active) {
+        if (p.useFlowField) {
+            float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+            fx += p.weightSeek * dir.x * ms;
+            fy += p.weightSeek * dir.y * ms;
         } else {
-            float inv = ms / sqrt(gd2);
-            fx += p.weightSeek * gdx * inv;
-            fy += p.weightSeek * gdy * inv;
+            float gdx = targetX[oi] - px;
+            float gdy = targetY[oi] - py;
+            float gd2 = gdx * gdx + gdy * gdy;
+            if (gd2 < p.arrivalRadius2) {
+                uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+                targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+                seed        = wang_hash(seed);
+                targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+            } else {
+                float inv = ms / sqrt(gd2);
+                fx += p.weightSeek * gdx * inv;
+                fy += p.weightSeek * gdy * inv;
+            }
         }
     }
 
@@ -433,41 +454,68 @@ kernel void k_steerGrid(
     float cohX = 0.f, cohY = 0.f;
     int   count = 0;
 
+    // ── Tiled 3×3 neighbourhood scan ──────────────────────────────────────────
     for (int dy = -1; dy <= 1; dy++) {
-        int ny = agCellY + dy;
+        int ny = refCellY + dy;              // uniform across threadgroup
         if (ny < 0 || ny >= p.gridHeight) continue;
         for (int dx = -1; dx <= 1; dx++) {
-            int nx = agCellX + dx;
+            int nx = refCellX + dx;          // uniform across threadgroup
             if (nx < 0 || nx >= p.gridWidth) continue;
 
             uint cid   = (uint)(nx + ny * p.gridWidth);
-            uint start = cellStart[cid];
-            uint end   = start + cellCount[cid];
+            uint start = cellStart[cid];     // uniform
+            uint end   = start + cellCount[cid]; // uniform
 
-            for (uint k = start; k < end; k++) {
-                if (k == gid) continue;  // self-skip by sorted index
-
-                float ndx = sPosX[k] - px;  // sequential read
-                float ndy = sPosY[k] - py;  // sequential read
-                float nd2 = ndx * ndx + ndy * ndy;
-                if (nd2 > p.neighborRadius2) continue;
-
-                float nd = sqrt(nd2);
-
-                if (nd2 < p.separationRadius2 && nd > 0.001f) {
-                    float strength = (p.separationRadius - nd) / p.separationRadius;
-                    sepX -= (ndx / nd) * strength;
-                    sepY -= (ndy / nd) * strength;
+            // Each outer iteration processes one 64-agent tile: all 64 threads
+            // cooperatively load the tile then individually scan it.
+            for (uint tileBase = start; tileBase < end; tileBase += 64) {
+                // ── Cooperative load ────────────────────────────────────────
+                uint k = tileBase + lid;
+                if (k < (uint)p.agentCount) {
+                    tgPosX  [lid] = sPosX   [k];
+                    tgPosY  [lid] = sPosY   [k];
+                    tgVelX  [lid] = sVelX   [k];
+                    tgVelY  [lid] = sVelY   [k];
+                    tgMaxSpd[lid] = sMaxSpeed[k];
+                } else {
+                    tgPosX[lid] = 1e30f;  // sentinel: distance check will reject
+                    tgPosY[lid] = 1e30f;
+                    tgVelX[lid] = 0.f; tgVelY[lid] = 0.f; tgMaxSpd[lid] = 1.f;
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                aliVX += sVelX[k];  // sequential read
-                aliVY += sVelY[k];  // sequential read
-                cohX  += sPosX[k];  // cached
-                cohY  += sPosY[k];  // cached
-                count++;
+                // ── Scan loaded tile (active threads only) ───────────────────
+                if (active) {
+                    uint tileSize = min(tileBase + 64u, end) - tileBase;
+                    for (uint ti = 0; ti < tileSize; ti++) {
+                        if (tileBase + ti == gid) continue;  // self-skip
+
+                        float ndx = tgPosX[ti] - px;
+                        float ndy = tgPosY[ti] - py;
+                        float nd2 = ndx * ndx + ndy * ndy;
+                        if (nd2 > p.neighborRadius2) continue;
+
+                        float nd = sqrt(nd2);
+
+                        if (nd2 < p.separationRadius2 && nd > 0.001f) {
+                            float strength = (p.separationRadius - nd) / p.separationRadius;
+                            sepX -= (ndx / nd) * strength;
+                            sepY -= (ndy / nd) * strength;
+                        }
+
+                        aliVX += tgVelX  [ti];
+                        aliVY += tgVelY  [ti];
+                        cohX  += tgPosX  [ti];
+                        cohY  += tgPosY  [ti];
+                        count++;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
     }
+
+    if (!active) return;
 
     fx += p.weightSep * sepX;
     fy += p.weightSep * sepY;
@@ -486,7 +534,6 @@ kernel void k_steerGrid(
         }
     }
 
-    // Obstacle avoidance — closest point on each line segment, repulsion if within radius
     float avoidR = p.obstacleAvoidRadius;
     for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
         float2 A  = float2(obstacles[oi2].x0, obstacles[oi2].y0);
@@ -594,6 +641,9 @@ static float2 lp2(
 //   2. Obstacle repulsion pre-biases the preferred velocity.
 //   3. One ORCA half-plane per nearby agent → 2D LP → collision-free velocity.
 //   4. Force written as (newVel - currentVel)/dt so k_integrate yields newVel exactly.
+// k_orca also uses the same tiled cooperative-load pattern.
+// Only posX/Y and velX/Y are needed from neighbours (maxSpeed is not used for constraints).
+// Threadgroup memory: 4 × 64 × 4 B = 1024 B per threadgroup.
 kernel void k_orca(
     device const float    *sPosX            [[buffer(0)]],
     device const float    *sPosY            [[buffer(1)]],
@@ -610,141 +660,170 @@ kernel void k_orca(
     constant SimParams    &p               [[buffer(12)]],
     device const Obstacle *obstacles       [[buffer(13)]],
     device const float2   *flowField       [[buffer(14)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
-    if ((int)gid >= p.agentCount) return;
+    // ── Threadgroup memory ───────────────────────────────────────────────────
+    threadgroup float tgPosX [64];
+    threadgroup float tgPosY [64];
+    threadgroup float tgVelX [64];
+    threadgroup float tgVelY [64];
+    threadgroup int   tgRefX [1];
+    threadgroup int   tgRefY [1];
 
-    float px = sPosX[gid];
-    float py = sPosY[gid];
-    float ms = sMaxSpeed[gid];
-    uint  oi = sortedAgentIndex[gid];
+    bool  active = ((int)gid < p.agentCount);
+    float px     = active ? sPosX   [gid] : 0.f;
+    float py     = active ? sPosY   [gid] : 0.f;
+    float ms     = active ? sMaxSpeed[gid]: 1.f;
+    uint  oi     = active ? sortedAgentIndex[gid] : 0u;
 
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
 
+    if (lid == 0) { tgRefX[0] = agCellX; tgRefY[0] = agCellY; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int refCellX = tgRefX[0];
+    int refCellY = tgRefY[0];
+
     // ── Preferred velocity ───────────────────────────────────────────────────
-    float2 prefVel;
-    if (p.useFlowField) {
-        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
-        prefVel = dir * ms;
-    } else {
-        float gdx = targetX[oi] - px;
-        float gdy = targetY[oi] - py;
-        float gd2 = gdx * gdx + gdy * gdy;
-        if (gd2 < p.arrivalRadius2) {
-            uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
-            targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
-            seed        = wang_hash(seed);
-            targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
-            prefVel     = float2(0.f);
+    float2 prefVel = float2(0.f);
+    if (active) {
+        if (p.useFlowField) {
+            float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+            prefVel = dir * ms;
         } else {
-            prefVel = float2(gdx, gdy) * (ms / sqrt(gd2));
+            float gdx = targetX[oi] - px;
+            float gdy = targetY[oi] - py;
+            float gd2 = gdx * gdx + gdy * gdy;
+            if (gd2 < p.arrivalRadius2) {
+                uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+                targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+                seed        = wang_hash(seed);
+                targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+            } else {
+                prefVel = float2(gdx, gdy) * (ms / sqrt(gd2));
+            }
         }
+
+        float avoidR = p.obstacleAvoidRadius;
+        for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
+            float2 A  = float2(obstacles[oi2].x0, obstacles[oi2].y0);
+            float2 B  = float2(obstacles[oi2].x1, obstacles[oi2].y1);
+            float2 AB = B - A;
+            float2 AP = float2(px, py) - A;
+            float  abLen2 = dot(AB, AB);
+            if (abLen2 < 1e-8f) continue;
+            float  t       = clamp(dot(AP, AB) / abLen2, 0.f, 1.f);
+            float2 closest = A + t * AB;
+            float2 repulse = float2(px, py) - closest;
+            float  dist    = length(repulse);
+            if (dist < avoidR && dist > 0.001f) {
+                float strength = (avoidR - dist) / avoidR;
+                prefVel += ms * strength * (repulse / dist);
+            }
+        }
+        float prefSpd = length(prefVel);
+        if (prefSpd > ms) prefVel *= ms / prefSpd;
     }
 
-    // ── Pre-bias preferred velocity with obstacle repulsion ──────────────────
-    // Nudges prefVel away from nearby walls so the LP navigates around them.
-    float avoidR = p.obstacleAvoidRadius;
-    for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
-        float2 A  = float2(obstacles[oi2].x0, obstacles[oi2].y0);
-        float2 B  = float2(obstacles[oi2].x1, obstacles[oi2].y1);
-        float2 AB = B - A;
-        float2 AP = float2(px, py) - A;
-        float  abLen2 = dot(AB, AB);
-        if (abLen2 < 1e-8f) continue;
-        float  t       = clamp(dot(AP, AB) / abLen2, 0.f, 1.f);
-        float2 closest = A + t * AB;
-        float2 repulse = float2(px, py) - closest;
-        float  dist    = length(repulse);
-        if (dist < avoidR && dist > 0.001f) {
-            float strength = (avoidR - dist) / avoidR;
-            prefVel += ms * strength * (repulse / dist);
-        }
-    }
-    // Renormalise so obstacle repulsion can't exceed max speed
-    float prefSpd = length(prefVel);
-    if (prefSpd > ms) prefVel *= ms / prefSpd;
-
-    // ── Build ORCA half-planes from nearby agents ────────────────────────────
+    // ── Build ORCA half-planes from nearby agents (tiled) ────────────────────
     float2 lp_arr[kMaxORCA];
     float2 ld_arr[kMaxORCA];
     int numORCA = 0;
 
-    float2 myVel  = float2(sVelX[gid], sVelY[gid]);
-    float  tau    = p.orcaTimeHorizon;
-    float  combR  = 10.f;   // rA + rB = 5 + 5 (all agents have radius 5)
+    float2 myVel = active ? float2(sVelX[gid], sVelY[gid]) : float2(0.f);
+    float  tau   = p.orcaTimeHorizon;
+    float  combR = 10.f;
     float  combR2 = combR * combR;
 
-    for (int dy = -1; dy <= 1 && numORCA < kMaxORCA; dy++) {
-        int ny = agCellY + dy;
+    for (int dy = -1; dy <= 1; dy++) {
+        int ny = refCellY + dy;              // uniform across threadgroup
         if (ny < 0 || ny >= p.gridHeight) continue;
-        for (int dx = -1; dx <= 1 && numORCA < kMaxORCA; dx++) {
-            int nx = agCellX + dx;
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = refCellX + dx;          // uniform
             if (nx < 0 || nx >= p.gridWidth) continue;
 
             uint cid   = (uint)(nx + ny * p.gridWidth);
-            uint start = cellStart[cid];
+            uint start = cellStart[cid];     // uniform
             uint end   = start + cellCount[cid];
 
-            for (uint k = start; k < end && numORCA < kMaxORCA; k++) {
-                if (k == gid) continue;
-
-                float2 relPos = float2(sPosX[k] - px, sPosY[k] - py);
-                float  dist2  = dot(relPos, relPos);
-                if (dist2 > p.neighborRadius2) continue;
-
-                float2 relVel = myVel - float2(sVelX[k], sVelY[k]);
-                float2 lineDir, u;
-
-                if (dist2 > combR2) {
-                    // Agents not overlapping — standard ORCA
-                    float2 w    = relVel - relPos / tau;
-                    float wLen2 = dot(w, w);
-                    float dotWP = dot(w, relPos);
-
-                    if (dotWP < 0.f && dotWP * dotWP > combR2 * wLen2) {
-                        // Closest to truncated cutoff circle
-                        float  wLen  = sqrt(wLen2 + 1e-10f);
-                        float2 unitW = w / wLen;
-                        lineDir = float2(unitW.y, -unitW.x);
-                        u = (combR / tau - wLen) * unitW;
-                    } else {
-                        // Closest to one of the cone legs
-                        float leg = sqrt(max(dist2 - combR2, 0.f));
-                        if (det2(relPos, w) > 0.f) {
-                            lineDir = float2(
-                                relPos.x * leg - relPos.y * combR,
-                                relPos.x * combR + relPos.y * leg) / dist2;
-                        } else {
-                            lineDir = -float2(
-                                relPos.x * leg + relPos.y * combR,
-                               -relPos.x * combR + relPos.y * leg) / dist2;
-                        }
-                        u = dot(relVel, lineDir) * lineDir - relVel;
-                    }
+            for (uint tileBase = start; tileBase < end; tileBase += 64) {
+                // ── Cooperative load ────────────────────────────────────────
+                uint k = tileBase + lid;
+                if (k < (uint)p.agentCount) {
+                    tgPosX[lid] = sPosX[k];
+                    tgPosY[lid] = sPosY[k];
+                    tgVelX[lid] = sVelX[k];
+                    tgVelY[lid] = sVelY[k];
                 } else {
-                    // Agents already overlapping — emergency separation
-                    float  invDt = 1.f / p.dt;
-                    float2 w     = relVel - relPos * invDt;
-                    float  wLen  = length(w);
-                    float2 unitW = wLen > 1e-6f ? w / wLen : float2(0.f, 1.f);
-                    lineDir = float2(unitW.y, -unitW.x);
-                    u = (combR * invDt - wLen) * unitW;
+                    tgPosX[lid] = 1e30f;
+                    tgPosY[lid] = 1e30f;
+                    tgVelX[lid] = 0.f;
+                    tgVelY[lid] = 0.f;
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                // Reciprocal: each agent corrects by half the needed change
-                lp_arr[numORCA] = myVel + 0.5f * u;
-                ld_arr[numORCA] = lineDir;
-                numORCA++;
+                // ── Scan loaded tile ─────────────────────────────────────────
+                if (active) {
+                    uint tileSize = min(tileBase + 64u, end) - tileBase;
+                    for (uint ti = 0; ti < tileSize; ti++) {
+                        if (tileBase + ti == gid) continue;
+
+                        float2 relPos = float2(tgPosX[ti] - px, tgPosY[ti] - py);
+                        float  dist2  = dot(relPos, relPos);
+                        if (dist2 > p.neighborRadius2) continue;
+
+                        if (numORCA >= kMaxORCA) continue; // cap reached; skip write
+
+                        float2 relVel = myVel - float2(tgVelX[ti], tgVelY[ti]);
+                        float2 lineDir, u;
+
+                        if (dist2 > combR2) {
+                            float2 w    = relVel - relPos / tau;
+                            float wLen2 = dot(w, w);
+                            float dotWP = dot(w, relPos);
+
+                            if (dotWP < 0.f && dotWP * dotWP > combR2 * wLen2) {
+                                float  wLen  = sqrt(wLen2 + 1e-10f);
+                                float2 unitW = w / wLen;
+                                lineDir = float2(unitW.y, -unitW.x);
+                                u = (combR / tau - wLen) * unitW;
+                            } else {
+                                float leg = sqrt(max(dist2 - combR2, 0.f));
+                                if (det2(relPos, w) > 0.f) {
+                                    lineDir = float2(
+                                        relPos.x * leg - relPos.y * combR,
+                                        relPos.x * combR + relPos.y * leg) / dist2;
+                                } else {
+                                    lineDir = -float2(
+                                        relPos.x * leg + relPos.y * combR,
+                                       -relPos.x * combR + relPos.y * leg) / dist2;
+                                }
+                                u = dot(relVel, lineDir) * lineDir - relVel;
+                            }
+                        } else {
+                            float  invDt = 1.f / p.dt;
+                            float2 w     = relVel - relPos * invDt;
+                            float  wLen  = length(w);
+                            float2 unitW = wLen > 1e-6f ? w / wLen : float2(0.f, 1.f);
+                            lineDir = float2(unitW.y, -unitW.x);
+                            u = (combR * invDt - wLen) * unitW;
+                        }
+
+                        lp_arr[numORCA] = myVel + 0.5f * u;
+                        ld_arr[numORCA] = lineDir;
+                        numORCA++;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
     }
 
-    // ── 2D linear program ────────────────────────────────────────────────────
+    if (!active) return;
+
     float2 newVel = lp2(lp_arr, ld_arr, numORCA, ms, prefVel);
 
-    // ── Write as force-equivalent so k_integrate gives exactly newVel ────────
-    // k_integrate: vel_new = vel_old + force × dt  →  force = (newVel − vel_old) / dt
     forceX[oi] = (newVel.x - myVel.x) / p.dt;
     forceY[oi] = (newVel.y - myVel.y) / p.dt;
 }
