@@ -93,6 +93,17 @@ static const float kMinSegLen = 12.f;  // min px between draw sample points
         _isDrawing = NO;
         break;
 
+    // Right-click: place / move the flow field goal
+    case NSEventTypeRightMouseDown: {
+        NSPoint wp = [self worldPointFromEvent:event];
+        [_gpuSim setFlowFieldGoal:(float)wp.x y:(float)wp.y];
+        if (!_gpuSim.useFlowField) {
+            _gpuSim.useFlowField = YES;
+            NSLog(@"[CrowdSim] Flow field ON — right-click to move goal, F to toggle");
+        }
+        break;
+    }
+
     default: break;
     }
 }
@@ -127,7 +138,7 @@ static const float kMinSegLen = 12.f;  // min px between draw sample points
         backing:NSBackingStoreBuffered
         defer:NO];
 
-    [_window setTitle:@"CrowdSim  ·  1/2/3: scene  ·  Drag: draw obstacle  ·  C: clear"];
+    [_window setTitle:@"CrowdSim  ·  1/2/3: scene  ·  LDrag: draw  ·  RClick: flow goal  ·  F: flow  ·  O: ORCA  ·  C: clear"];
     [_window center];
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -168,13 +179,26 @@ static const float kMinSegLen = 12.f;  // min px between draw sample points
         else if ([ch isEqualToString:@"3"]) [weakSelf loadScenario:2];
         else if ([ch isEqualToString:@"c"] ||
                  [ch isEqualToString:@"C"]) { AppDelegate *s = weakSelf; [s loadScenario:s->_currentScenario]; }
+        else if ([ch isEqualToString:@"f"] ||
+                 [ch isEqualToString:@"F"]) {
+            AppDelegate *s = weakSelf;
+            s->_gpuSim.useFlowField = !s->_gpuSim.useFlowField;
+            NSLog(@"[CrowdSim] Flow field %@", s->_gpuSim.useFlowField ? @"ON" : @"OFF");
+        }
+        else if ([ch isEqualToString:@"o"] ||
+                 [ch isEqualToString:@"O"]) {
+            AppDelegate *s = weakSelf;
+            s->_gpuSim.useORCA = !s->_gpuSim.useORCA;
+            NSLog(@"[CrowdSim] ORCA %@", s->_gpuSim.useORCA ? @"ON" : @"OFF");
+        }
         return event;
     }];
 
     // Mouse: left-drag draws obstacle segments directly onto the simulation
     NSEventMask drawMask = NSEventMaskLeftMouseDown
                          | NSEventMaskLeftMouseDragged
-                         | NSEventMaskLeftMouseUp;
+                         | NSEventMaskLeftMouseUp
+                         | NSEventMaskRightMouseDown;
     [NSEvent addLocalMonitorForEventsMatchingMask:drawMask
                                           handler:^NSEvent *(NSEvent *event) {
         [weakSelf handleMouseEvent:event];

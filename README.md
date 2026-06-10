@@ -68,17 +68,6 @@ Without `k_reorder`, `k_steerGrid` accessed neighbor data as `posX[sortedAgentIn
 
 - Verified: 100,000 agents at 60 FPS [GPU]
 
-**Phase 5 — Obstacle Avoidance and Crowd Scenarios (complete)**
-
-- `Obstacle` struct (`x0,y0,x1,y1`) added to `SharedTypes.h` — shared between C++ and Metal shaders
-- `GPUSimulation.loadObstacles:count:` uploads up to 64 line segments to a GPU buffer; `SimParams.obstacleCount` drives the per-frame avoidance loop
-- `k_steerGrid` extended: after flocking forces, each agent checks all obstacle segments, computes closest point on segment, and applies a 3× repulsion force within a 40 px avoidance radius
-- Three interactive scenes switchable at runtime with keys `1` / `2` / `3`: Open Field, Barrier (staggered walls forcing a zigzag), Pillars (3×2 grid of square columns)
-- Velocity colour coding: `vs_agent` reads per-agent `velX/Y` and `maxSpeed` buffers; slow agents = blue, fast = red (HSV hue sweep)
-- Obstacle lines rendered by a second pipeline (`vs_obstacle` / `fs_obstacle`) using `MTLPrimitiveTypeLine`
-- Window title updates to show the active scene name on each switch
-- Verified: 100,000 agents at 60 FPS with obstacle avoidance active [GPU]
-
 ## Phase 4 — Performance Engineering and Benchmarking
 
 **Goal:** Quantify scalability and understand performance bottlenecks across six scenarios: four CPU thread counts and two GPU algorithms.
@@ -268,11 +257,14 @@ Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 
 
 **Controls**
 
-| Input | Action |
-| ----- | ------ |
-| `1` / `2` / `3` | Switch scene (Open Field / Barrier / Pillars) — also clears drawn obstacles |
-| Left-click drag | Draw obstacle segments freehand; agents avoid them immediately |
-| `C` | Clear drawn segments, restore current scene's preset obstacles |
+| Input           | Action                                                                                  |
+| --------------- | --------------------------------------------------------------------------------------- |
+| `1` / `2` / `3` | Switch scene (Open Field / Barrier / Pillars) — also clears drawn obstacles             |
+| Left-click drag | Draw obstacle segments freehand; agents avoid them immediately                          |
+| Right-click     | Place / move the flow-field goal (also enables flow-field mode if not already active)   |
+| `F`             | Toggle flow-field navigation (agents seek a shared goal vs. random wandering)           |
+| `O`             | Toggle ORCA collision avoidance (replaces heuristic separation with LP-based avoidance) |
+| `C`             | Clear drawn segments, restore current scene's preset obstacles                          |
 
 ---
 
@@ -286,42 +278,65 @@ Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 
 | 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
 | 4       | CPU vs GPU benchmarking suite            | 100K+          | Complete |
 | 5       | Obstacle avoidance + crowd scenarios     | 100K @ 60 FPS  | Complete |
-| 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Planned  |
+| 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Complete |
 | Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
 
 ---
 
-## Phase 6 — Advanced Crowd Navigation
+## Phase 6 — Advanced Crowd Navigation (complete)
 
-**Goal:** Replace simple steering with techniques used in modern games, robotics, and crowd simulation research.
+### Flow Fields
 
-**Flow fields** replace per-agent goal-seeking with a global vector field precomputed over the grid:
-
-```
-Destination
-    ↓
-Global Vector Field
-    ↓
-Thousands of Agents sample nearest cell → O(1) path lookup
-```
-
-Benefits: extremely scalable, common in RTS games, no per-agent pathfinding cost.
-
-**ORCA (Optimal Reciprocal Collision Avoidance)** replaces heuristic separation with predictive collision avoidance:
+Flow fields replace per-agent goal-seeking with a global vector field precomputed over the grid:
 
 ```
-Predict future collisions
+Destination (right-click to place)
     ↓
-Construct velocity constraints (half-planes)
+8-directional Dijkstra BFS over 26×15 grid (390 cells, 50 px each)
     ↓
-Solve local linear program
+390 normalised float2 vectors uploaded to GPU (3 KB buffer)
     ↓
-Select closest collision-free velocity
+Each agent samples flowField[cellX + cellY * gridWidth] → O(1) path lookup
 ```
 
-Benefits: deadlock reduction, more realistic crowd movement, robotics-grade navigation.
+Benefits: all 100K agents share one pathfinding computation, naturally routes around obstacles, familiar in RTS games.
 
-**Goal:** Demonstrate advanced multi-agent navigation beyond traditional boids-style steering.
+A white downward-pointing triangle marks the current goal. Right-click anywhere to move it; press `F` to toggle flow-field mode (agents revert to random wandering when off).
+
+Implementation: CPU-side Dijkstra runs on SimParams change via a dirty-flag batched to once per frame. Diagonal moves check both cardinal neighbours to prevent corner-cutting through walls.
+
+### ORCA (Optimal Reciprocal Collision Avoidance)
+
+ORCA replaces the heuristic separation force with mathematically optimal, deadlock-free collision avoidance. Press `O` to toggle.
+
+```
+For each agent A and each nearby agent B (spatial-hash neighbour):
+    Relative position p = B.pos − A.pos
+    Relative velocity v = A.vel − B.vel
+    Velocity obstacle VO = set of relative velocities that cause collision within τ seconds
+    ORCA half-plane: A's new velocity must lie outside ½ of VO (reciprocal responsibility)
+        ↓
+Collect up to 20 half-plane constraints
+        ↓
+2D linear program (RVO2 algorithm): find velocity closest to preferred velocity
+        that satisfies all half-plane constraints within the speed disk
+        ↓
+Write result as a force-equivalent so k_integrate yields the LP solution exactly
+```
+
+**Key properties:**
+- **Reciprocal**: each agent takes half the avoidance responsibility, eliminating oscillation
+- **Optimal**: the LP gives the velocity mathematically closest to the preferred direction
+- **Deadlock-free**: the LP always finds a feasible velocity (the partial solution is used on infeasibility)
+- **Composable with flow fields**: preferred velocity comes from the flow field (or direct seek); ORCA handles only local collisions
+
+**Implementation details:**
+- `k_orca` kernel (Pass 6) has the same buffer layout as `k_steerGrid` — toggled by `SimParams.useORCA`
+- LP helper `lp1` / `lp2` are static Metal functions; `lp2` calls `lp1` per violated constraint
+- Max 20 ORCA constraints per agent (`kMaxORCA`) — caps LP cost; excess neighbours skipped
+- Obstacle avoidance: wall repulsion pre-biases the preferred velocity before the LP, so the LP routes around walls while resolving agent-agent collisions
+- Time horizon τ = 1.5 s (configurable via `SimParams.orcaTimeHorizon`); agents begin adjusting velocity when collision is predicted within τ seconds
+- Force-equivalent write: `forceX[oi] = (newVel.x − currentVel.x) / dt`; after `k_integrate` adds `force × dt`, the velocity is exactly `newVel` with no other changes needed
 
 ---
 

@@ -31,4 +31,9 @@ struct SimParams {
     int   obstacleCount;
     float obstacleAvoidRadius;
     float obstacleAvoidRadius2;
+    // Phase 6 — flow field navigation (0 = direct seek, 1 = sample flow field)
+    int   useFlowField;
+    // Phase 7 — ORCA velocity-space collision avoidance
+    int   useORCA;           // 0 = flocking + repulsion, 1 = ORCA replaces separation
+    float orcaTimeHorizon;   // seconds of lookahead for ORCA constraints (default 1.5)
 };

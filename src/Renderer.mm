@@ -9,6 +9,7 @@ static const uint32_t kMaxAgentsCPU = 50000;
 @interface Renderer ()
 - (void)buildAgentPipelineWithView:(MTKView *)view;
 - (void)buildObstaclePipelineWithView:(MTKView *)view;
+- (void)buildGoalPipelineWithView:(MTKView *)view;
 @end
 
 @implementation Renderer {
@@ -17,6 +18,7 @@ static const uint32_t kMaxAgentsCPU = 50000;
     id<MTLLibrary>             _library;
     id<MTLRenderPipelineState> _agentPipeline;
     id<MTLRenderPipelineState> _obstaclePipeline;
+    id<MTLRenderPipelineState> _goalPipeline;
 
     // CPU-path render buffers (separate SoA, matches shader buffer layout)
     id<MTLBuffer> _posXBuffer;
@@ -56,6 +58,7 @@ static const uint32_t kMaxAgentsCPU = 50000;
     if (_library) {
         [self buildAgentPipelineWithView:view];
         [self buildObstaclePipelineWithView:view];
+        [self buildGoalPipelineWithView:view];
     }
 
     NSUInteger sz = kMaxAgentsCPU * sizeof(float);
@@ -78,6 +81,19 @@ static const uint32_t kMaxAgentsCPU = 50000;
     view.preferredFramesPerSecond = 60;
 
     return self;
+}
+
+- (void)buildGoalPipelineWithView:(MTKView *)view {
+    id<MTLFunction> vsFn = [_library newFunctionWithName:@"vs_goal"];
+    id<MTLFunction> fsFn = [_library newFunctionWithName:@"fs_goal"];
+    if (!vsFn || !fsFn) { NSLog(@"[Renderer] vs_goal / fs_goal not found."); return; }
+    MTLRenderPipelineDescriptor *pd    = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction                  = vsFn;
+    pd.fragmentFunction                = fsFn;
+    pd.colorAttachments[0].pixelFormat = view.colorPixelFormat;
+    NSError *err = nil;
+    _goalPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (err) NSLog(@"[Renderer] Goal pipeline error: %@", err);
 }
 
 - (void)buildObstaclePipelineWithView:(MTKView *)view {
@@ -207,6 +223,17 @@ static const uint32_t kMaxAgentsCPU = 50000;
         [enc drawPrimitives:MTLPrimitiveTypeLine
                 vertexStart:0
                 vertexCount:_gpuSim.obstacleCount * 2];
+    }
+
+    // Draw flow field goal marker (drawn last so it always appears on top)
+    if (_goalPipeline && _gpuSim && _gpuSim.flowGoalSet && _gpuSim.useFlowField) {
+        float goal[2] = { _gpuSim.flowGoalX, _gpuSim.flowGoalY };
+        [enc setRenderPipelineState:_goalPipeline];
+        [enc setVertexBytes:goal length:sizeof(goal) atIndex:0];
+        [enc setVertexBuffer:_vpBuffer offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0
+                vertexCount:3];
     }
 
     [enc endEncoding];

@@ -107,6 +107,34 @@ fragment float4 fs_obstacle(ObstacleVert in [[stage_in]]) {
     return float4(0.85f, 0.85f, 0.85f, 1.f);
 }
 
+// ── Phase 6: flow field goal marker (downward-pointing triangle) ──────────────
+
+// Buffer layout:
+//   0 — float2 goal  (world-space position)
+//   1 — float2 vp    (viewport size in logical points)
+vertex ObstacleVert vs_goal(
+    uint             vid  [[vertex_id]],
+    constant float2 &goal [[buffer(0)]],
+    constant float2 &vp   [[buffer(1)]]
+) {
+    // Downward-pointing triangle: tip marks the goal, base sits above it
+    float2 offsets[3] = {
+        float2(-11.f, -13.f),  // top-left
+        float2( 11.f, -13.f),  // top-right
+        float2(  0.f,  13.f),  // tip  (world Y down = visually below)
+    };
+    float2 worldPos = goal + offsets[vid];
+    float2 ndc      = worldPos / vp * 2.f - 1.f;
+    ndc.y           = -ndc.y;
+    ObstacleVert out;
+    out.position = float4(ndc, 0.f, 1.f);
+    return out;
+}
+
+fragment float4 fs_goal(ObstacleVert in [[stage_in]]) {
+    return float4(1.f, 1.f, 1.f, 1.f);
+}
+
 // ── Phase 2: GPU compute kernels ─────────────────────────────────────────────
 
 // Pass 1 — Steering
@@ -347,22 +375,23 @@ kernel void k_reorder(
 //   5 targetX (rw)  6 targetY (rw)
 //   7 forceX (w)    8 forceY (w)
 //   9 cellStart (r)  10 cellCount (r)  11 sortedAgentIndex (r)  12 SimParams
-//   13 obstacles (r)
+//   13 obstacles (r)  14 flowField (r)
 kernel void k_steerGrid(
-    device const float *sPosX            [[buffer(0)]],
-    device const float *sPosY            [[buffer(1)]],
-    device const float *sVelX            [[buffer(2)]],
-    device const float *sVelY            [[buffer(3)]],
-    device const float *sMaxSpeed        [[buffer(4)]],
-    device float       *targetX          [[buffer(5)]],
-    device float       *targetY          [[buffer(6)]],
-    device float       *forceX           [[buffer(7)]],
-    device float       *forceY           [[buffer(8)]],
-    device const uint  *cellStart        [[buffer(9)]],
-    device const uint  *cellCount        [[buffer(10)]],
+    device const float    *sPosX            [[buffer(0)]],
+    device const float    *sPosY            [[buffer(1)]],
+    device const float    *sVelX            [[buffer(2)]],
+    device const float    *sVelY            [[buffer(3)]],
+    device const float    *sMaxSpeed        [[buffer(4)]],
+    device float          *targetX          [[buffer(5)]],
+    device float          *targetY          [[buffer(6)]],
+    device float          *forceX           [[buffer(7)]],
+    device float          *forceY           [[buffer(8)]],
+    device const uint     *cellStart        [[buffer(9)]],
+    device const uint     *cellCount        [[buffer(10)]],
     device const uint     *sortedAgentIndex [[buffer(11)]],
     constant SimParams    &p               [[buffer(12)]],
     device const Obstacle *obstacles       [[buffer(13)]],
+    device const float2   *flowField       [[buffer(14)]],
     uint gid [[thread_position_in_grid]]   // gid = sorted index k
 ) {
     if ((int)gid >= p.agentCount) return;
@@ -370,29 +399,34 @@ kernel void k_steerGrid(
     float px = sPosX[gid];
     float py = sPosY[gid];
     float ms = sMaxSpeed[gid];
-    uint  oi = sortedAgentIndex[gid];  // original agent index — used for target/force writes
+    uint  oi = sortedAgentIndex[gid];
 
     float fx = 0.f, fy = 0.f;
 
-    // Goal seeking (target stored by original index)
-    float gdx = targetX[oi] - px;
-    float gdy = targetY[oi] - py;
-    float gd2 = gdx * gdx + gdy * gdy;
+    // Cell coordinates — used by both seeking and the neighbourhood scan below
+    int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
+    int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
 
-    if (gd2 < p.arrivalRadius2) {
-        uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
-        targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
-        seed        = wang_hash(seed);
-        targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+    // Goal seeking — flow field samples one vector; direct seek steers to individual target
+    if (p.useFlowField) {
+        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+        fx += p.weightSeek * dir.x * ms;
+        fy += p.weightSeek * dir.y * ms;
     } else {
-        float inv = ms / sqrt(gd2);
-        fx += p.weightSeek * gdx * inv;
-        fy += p.weightSeek * gdy * inv;
+        float gdx = targetX[oi] - px;
+        float gdy = targetY[oi] - py;
+        float gd2 = gdx * gdx + gdy * gdy;
+        if (gd2 < p.arrivalRadius2) {
+            uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+            targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+            seed        = wang_hash(seed);
+            targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+        } else {
+            float inv = ms / sqrt(gd2);
+            fx += p.weightSeek * gdx * inv;
+            fy += p.weightSeek * gdy * inv;
+        }
     }
-
-    // 3×3 grid neighbourhood — reads sPosX/Y/sVelX/Y sequentially within each cell
-    int agCellX = (int)(px / p.cellSize);
-    int agCellY = (int)(py / p.cellSize);
 
     float sepX = 0.f, sepY = 0.f;
     float aliVX = 0.f, aliVY = 0.f;
@@ -472,4 +506,245 @@ kernel void k_steerGrid(
 
     forceX[oi] = fx;
     forceY[oi] = fy;
+}
+
+// ── Phase 7: ORCA (Optimal Reciprocal Collision Avoidance) ────────────────────
+//
+// Implements the RVO2 algorithm: for each pair of nearby agents, one ORCA half-plane
+// constraint is built in velocity space.  A 2D linear program then finds the velocity
+// closest to the preferred (goal-seeking) velocity that satisfies every constraint.
+//
+// Buffer layout: identical to k_steerGrid (buffers 0–14) — no extra bindings needed.
+
+// 2D cross product (signed area of parallelogram spanned by a and b).
+static float det2(float2 a, float2 b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+// RVO2 linearProgram1: find the point on constraint line `lineNo` that is
+// (a) inside the speed disk of radius `radius`, (b) satisfies constraints [0, lineNo),
+// and (c) is closest to `optVel` projected onto the line.
+// Returns false when the problem is infeasible.
+static bool lp1(
+    thread const float2 *lp,   // constraint line points (velocity-space)
+    thread const float2 *ld,   // constraint line directions (unit vectors)
+    int    lineNo,
+    float  radius,
+    float2 optVel,
+    thread float2 &result
+) {
+    // Speed-disk intersection: |lp + t*ld|² = radius²
+    float dot_  = dot(lp[lineNo], ld[lineNo]);
+    float disc  = dot_ * dot_ + radius * radius - dot(lp[lineNo], lp[lineNo]);
+    if (disc < 0.f) return false;
+
+    float sqrtD = sqrt(disc);
+    float tL    = -dot_ - sqrtD;
+    float tR    = -dot_ + sqrtD;
+
+    // Clip range to previous half-planes
+    for (int j = 0; j < lineNo; j++) {
+        float denom = det2(ld[lineNo], ld[j]);
+        float numer = det2(ld[j], lp[lineNo] - lp[j]);
+        if (abs(denom) < 1e-5f) {
+            if (numer < 0.f) return false;
+            continue;
+        }
+        float t = numer / denom;
+        if (denom >= 0.f) tR = min(tR, t);
+        else              tL = max(tL, t);
+        if (tL > tR) return false;
+    }
+
+    // Project optVel onto the constraint line and clamp to the feasible segment
+    float t = dot(ld[lineNo], optVel - lp[lineNo]);
+    result  = lp[lineNo] + clamp(t, tL, tR) * ld[lineNo];
+    return true;
+}
+
+// RVO2 linearProgram2: minimum-norm feasible velocity.
+// Iterates constraints in order; on violation re-solves on the violated line boundary.
+// On full infeasibility returns the partial solution (satisfies the prefix of constraints).
+static float2 lp2(
+    thread const float2 *lp,
+    thread const float2 *ld,
+    int    numLines,
+    float  radius,
+    float2 optVel
+) {
+    float  spd    = length(optVel);
+    float2 result = spd > radius ? (optVel / spd) * radius : optVel;
+
+    for (int i = 0; i < numLines; i++) {
+        if (det2(ld[i], lp[i] - result) > 0.f) {
+            float2 prev = result;
+            if (!lp1(lp, ld, i, radius, optVel, result))
+                result = prev;  // partial solution — accept and continue
+        }
+    }
+    return result;
+}
+
+#define kMaxORCA 20  // max ORCA constraints per agent (caps LP size)
+
+// Pass 6 (ORCA mode): replace flocking with velocity-space collision avoidance.
+//
+// Per agent:
+//   1. Preferred velocity = flow-field direction × maxSpeed (or direct seek).
+//   2. Obstacle repulsion pre-biases the preferred velocity.
+//   3. One ORCA half-plane per nearby agent → 2D LP → collision-free velocity.
+//   4. Force written as (newVel - currentVel)/dt so k_integrate yields newVel exactly.
+kernel void k_orca(
+    device const float    *sPosX            [[buffer(0)]],
+    device const float    *sPosY            [[buffer(1)]],
+    device const float    *sVelX            [[buffer(2)]],
+    device const float    *sVelY            [[buffer(3)]],
+    device const float    *sMaxSpeed        [[buffer(4)]],
+    device float          *targetX          [[buffer(5)]],
+    device float          *targetY          [[buffer(6)]],
+    device float          *forceX           [[buffer(7)]],
+    device float          *forceY           [[buffer(8)]],
+    device const uint     *cellStart        [[buffer(9)]],
+    device const uint     *cellCount        [[buffer(10)]],
+    device const uint     *sortedAgentIndex [[buffer(11)]],
+    constant SimParams    &p               [[buffer(12)]],
+    device const Obstacle *obstacles       [[buffer(13)]],
+    device const float2   *flowField       [[buffer(14)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+
+    float px = sPosX[gid];
+    float py = sPosY[gid];
+    float ms = sMaxSpeed[gid];
+    uint  oi = sortedAgentIndex[gid];
+
+    int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
+    int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
+
+    // ── Preferred velocity ───────────────────────────────────────────────────
+    float2 prefVel;
+    if (p.useFlowField) {
+        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+        prefVel = dir * ms;
+    } else {
+        float gdx = targetX[oi] - px;
+        float gdy = targetY[oi] - py;
+        float gd2 = gdx * gdx + gdy * gdy;
+        if (gd2 < p.arrivalRadius2) {
+            uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+            targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+            seed        = wang_hash(seed);
+            targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+            prefVel     = float2(0.f);
+        } else {
+            prefVel = float2(gdx, gdy) * (ms / sqrt(gd2));
+        }
+    }
+
+    // ── Pre-bias preferred velocity with obstacle repulsion ──────────────────
+    // Nudges prefVel away from nearby walls so the LP navigates around them.
+    float avoidR = p.obstacleAvoidRadius;
+    for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
+        float2 A  = float2(obstacles[oi2].x0, obstacles[oi2].y0);
+        float2 B  = float2(obstacles[oi2].x1, obstacles[oi2].y1);
+        float2 AB = B - A;
+        float2 AP = float2(px, py) - A;
+        float  abLen2 = dot(AB, AB);
+        if (abLen2 < 1e-8f) continue;
+        float  t       = clamp(dot(AP, AB) / abLen2, 0.f, 1.f);
+        float2 closest = A + t * AB;
+        float2 repulse = float2(px, py) - closest;
+        float  dist    = length(repulse);
+        if (dist < avoidR && dist > 0.001f) {
+            float strength = (avoidR - dist) / avoidR;
+            prefVel += ms * strength * (repulse / dist);
+        }
+    }
+    // Renormalise so obstacle repulsion can't exceed max speed
+    float prefSpd = length(prefVel);
+    if (prefSpd > ms) prefVel *= ms / prefSpd;
+
+    // ── Build ORCA half-planes from nearby agents ────────────────────────────
+    float2 lp_arr[kMaxORCA];
+    float2 ld_arr[kMaxORCA];
+    int numORCA = 0;
+
+    float2 myVel  = float2(sVelX[gid], sVelY[gid]);
+    float  tau    = p.orcaTimeHorizon;
+    float  combR  = 10.f;   // rA + rB = 5 + 5 (all agents have radius 5)
+    float  combR2 = combR * combR;
+
+    for (int dy = -1; dy <= 1 && numORCA < kMaxORCA; dy++) {
+        int ny = agCellY + dy;
+        if (ny < 0 || ny >= p.gridHeight) continue;
+        for (int dx = -1; dx <= 1 && numORCA < kMaxORCA; dx++) {
+            int nx = agCellX + dx;
+            if (nx < 0 || nx >= p.gridWidth) continue;
+
+            uint cid   = (uint)(nx + ny * p.gridWidth);
+            uint start = cellStart[cid];
+            uint end   = start + cellCount[cid];
+
+            for (uint k = start; k < end && numORCA < kMaxORCA; k++) {
+                if (k == gid) continue;
+
+                float2 relPos = float2(sPosX[k] - px, sPosY[k] - py);
+                float  dist2  = dot(relPos, relPos);
+                if (dist2 > p.neighborRadius2) continue;
+
+                float2 relVel = myVel - float2(sVelX[k], sVelY[k]);
+                float2 lineDir, u;
+
+                if (dist2 > combR2) {
+                    // Agents not overlapping — standard ORCA
+                    float2 w    = relVel - relPos / tau;
+                    float wLen2 = dot(w, w);
+                    float dotWP = dot(w, relPos);
+
+                    if (dotWP < 0.f && dotWP * dotWP > combR2 * wLen2) {
+                        // Closest to truncated cutoff circle
+                        float  wLen  = sqrt(wLen2 + 1e-10f);
+                        float2 unitW = w / wLen;
+                        lineDir = float2(unitW.y, -unitW.x);
+                        u = (combR / tau - wLen) * unitW;
+                    } else {
+                        // Closest to one of the cone legs
+                        float leg = sqrt(max(dist2 - combR2, 0.f));
+                        if (det2(relPos, w) > 0.f) {
+                            lineDir = float2(
+                                relPos.x * leg - relPos.y * combR,
+                                relPos.x * combR + relPos.y * leg) / dist2;
+                        } else {
+                            lineDir = -float2(
+                                relPos.x * leg + relPos.y * combR,
+                               -relPos.x * combR + relPos.y * leg) / dist2;
+                        }
+                        u = dot(relVel, lineDir) * lineDir - relVel;
+                    }
+                } else {
+                    // Agents already overlapping — emergency separation
+                    float  invDt = 1.f / p.dt;
+                    float2 w     = relVel - relPos * invDt;
+                    float  wLen  = length(w);
+                    float2 unitW = wLen > 1e-6f ? w / wLen : float2(0.f, 1.f);
+                    lineDir = float2(unitW.y, -unitW.x);
+                    u = (combR * invDt - wLen) * unitW;
+                }
+
+                // Reciprocal: each agent corrects by half the needed change
+                lp_arr[numORCA] = myVel + 0.5f * u;
+                ld_arr[numORCA] = lineDir;
+                numORCA++;
+            }
+        }
+    }
+
+    // ── 2D linear program ────────────────────────────────────────────────────
+    float2 newVel = lp2(lp_arr, ld_arr, numORCA, ms, prefVel);
+
+    // ── Write as force-equivalent so k_integrate gives exactly newVel ────────
+    // k_integrate: vel_new = vel_old + force × dt  →  force = (newVel − vel_old) / dt
+    forceX[oi] = (newVel.x - myVel.x) / p.dt;
+    forceY[oi] = (newVel.y - myVel.y) / p.dt;
 }

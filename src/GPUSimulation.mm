@@ -2,6 +2,9 @@
 #include "Simulation.h"    // world/behavior constants
 #include "SharedTypes.h"
 #include <random>
+#include <queue>
+#include <algorithm>
+#include <cmath>
 
 // Grid dimensions derived from world size and neighbor radius.
 // cellSize == kNeighborRadius ensures a 3×3 cell search covers the full interaction circle.
@@ -24,6 +27,10 @@ static const uint32_t kInitialObstacleCapacity = 64;
     id<MTLComputePipelineState> _scatterPipeline;
     id<MTLComputePipelineState> _reorderPipeline;
     id<MTLComputePipelineState> _steerGridPipeline;
+
+    // Phase 7 — ORCA collision avoidance (replaces k_steerGrid when active)
+    id<MTLComputePipelineState> _orcaPipeline;
+    BOOL                        _useORCA;
 
     // SoA agent data — shared storage; CPU writes once at init, GPU owns thereafter
     id<MTLBuffer> _posX, _posY;
@@ -50,6 +57,13 @@ static const uint32_t kInitialObstacleCapacity = 64;
     id<MTLBuffer> _obstacleBuffer;
     uint32_t      _obstacleCapacity;
 
+    // Phase 6 — flow field navigation
+    id<MTLBuffer> _flowFieldBuffer;  // float2[kNumCells]: one direction vector per grid cell
+    float         _flowGoalX, _flowGoalY;
+    BOOL          _flowGoalSet;      // NO until the user places the first goal
+    BOOL          _flowFieldDirty;   // recompute on next encode if YES
+    BOOL          _useFlowField;
+
     uint32_t _agentCount;
     uint32_t _obstacleCount;
     int      _frameIndex;
@@ -65,6 +79,10 @@ static const uint32_t kInitialObstacleCapacity = 64;
 @synthesize maxSpeedBuffer  = _maxSpeed;
 @synthesize obstacleBuffer  = _obstacleBuffer;
 @synthesize useGridSteering = _useGridSteering;
+@synthesize flowGoalSet     = _flowGoalSet;
+@synthesize flowGoalX       = _flowGoalX;
+@synthesize flowGoalY       = _flowGoalY;
+// useFlowField has a custom setter (syncs SimParams), so no @synthesize
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device
                        library:(id<MTLLibrary>)library
@@ -101,6 +119,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _scatterPipeline   = [self pipelineNamed:@"k_scatter"   library:library];
     _reorderPipeline   = [self pipelineNamed:@"k_reorder"   library:library];
     _steerGridPipeline = [self pipelineNamed:@"k_steerGrid" library:library];
+    _orcaPipeline      = [self pipelineNamed:@"k_orca"      library:library];
 }
 
 // ── Buffer allocation + CPU initialisation ────────────────────────────────────
@@ -142,6 +161,13 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _obstacleCapacity = kInitialObstacleCapacity;
     _obstacleBuffer   = [self sharedBuf:_obstacleCapacity * sizeof(struct Obstacle)];
     _obstacleCount    = 0;
+
+    // Flow field: float2 per cell, zero-initialised (no flow until goal is set)
+    _flowFieldBuffer = [self sharedBuf:kNumCells * sizeof(float) * 2];
+    memset(_flowFieldBuffer.contents, 0, kNumCells * sizeof(float) * 2);
+    _flowGoalSet    = NO;
+    _flowFieldDirty = NO;
+    _useFlowField   = NO;
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> rx(0.f, Simulation::kWorldWidth);
@@ -185,6 +211,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     p->obstacleCount        = 0;
     p->obstacleAvoidRadius  = 40.f;
     p->obstacleAvoidRadius2 = 40.f * 40.f;
+    p->useFlowField         = 0;
+    p->useORCA              = 0;
+    p->orcaTimeHorizon      = 1.5f;
 }
 
 // ── Obstacle loading ──────────────────────────────────────────────────────────
@@ -207,6 +236,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
         memcpy(_obstacleBuffer.contents, obstacles, count * sizeof(struct Obstacle));
     _obstacleCount = count;
     ((SimParams *)_params.contents)->obstacleCount = (int)count;
+    if (_useFlowField && _flowGoalSet) _flowFieldDirty = YES;
 }
 
 - (void)appendObstacle:(struct Obstacle)obs {
@@ -214,12 +244,131 @@ static const uint32_t kInitialObstacleCapacity = 64;
     struct Obstacle *buf = (struct Obstacle *)_obstacleBuffer.contents;
     buf[_obstacleCount++] = obs;
     ((SimParams *)_params.contents)->obstacleCount = (int)_obstacleCount;
+    if (_useFlowField && _flowGoalSet) _flowFieldDirty = YES;
+}
+
+// ── Flow field ────────────────────────────────────────────────────────────────
+
+- (BOOL)useFlowField { return _useFlowField; }
+
+- (void)setUseFlowField:(BOOL)on {
+    _useFlowField = on;
+    ((SimParams *)_params.contents)->useFlowField = on ? 1 : 0;
+    if (on && _flowGoalSet) _flowFieldDirty = YES;
+}
+
+- (BOOL)useORCA { return _useORCA; }
+
+- (void)setUseORCA:(BOOL)on {
+    _useORCA = on;
+    ((SimParams *)_params.contents)->useORCA = on ? 1 : 0;
+}
+
+- (void)setFlowFieldGoal:(float)x y:(float)y {
+    _flowGoalX   = x;
+    _flowGoalY   = y;
+    _flowGoalSet = YES;
+    [self recomputeFlowField];
+}
+
+- (void)recomputeFlowField {
+    if (!_flowGoalSet) return;
+
+    const float cellSz = Simulation::kNeighborRadius;           // 50 px
+    const float blockR = cellSz * 0.5f;                        // block cells whose centres are within 25 px of an obstacle
+
+    // ── Build blocked map ──────────────────────────────────────────────────
+    bool blocked[kNumCells] = {};
+    if (_obstacleCount > 0) {
+        const struct Obstacle *obs = (const struct Obstacle *)_obstacleBuffer.contents;
+        for (int c = 0; c < kNumCells; c++) {
+            float cx = ((c % kGridWidth) + 0.5f) * cellSz;
+            float cy = ((c / kGridWidth) + 0.5f) * cellSz;
+            for (uint32_t oi = 0; oi < _obstacleCount && !blocked[c]; oi++) {
+                float ax = obs[oi].x0, ay = obs[oi].y0;
+                float bx = obs[oi].x1, by = obs[oi].y1;
+                float abx = bx-ax, aby = by-ay;
+                float len2 = abx*abx + aby*aby;
+                float t = len2 > 0.f
+                    ? std::clamp(((cx-ax)*abx + (cy-ay)*aby) / len2, 0.f, 1.f)
+                    : 0.f;
+                float dx = cx-(ax+t*abx), dy = cy-(ay+t*aby);
+                blocked[c] = (dx*dx + dy*dy) < blockR*blockR;
+            }
+        }
+    }
+
+    // ── Dijkstra (8-directional) from goal cell ────────────────────────────
+    static const int   NDX[] = {-1, 0, 1,-1, 1,-1, 0, 1};
+    static const int   NDY[] = {-1,-1,-1, 0, 0, 1, 1, 1};
+    static const float NDC[] = {1.414f,1.f,1.414f,1.f,1.f,1.414f,1.f,1.414f};
+
+    float cost[kNumCells];
+    std::fill(cost, cost+kNumCells, 1e30f);
+
+    int gcx = std::clamp((int)(_flowGoalX / cellSz), 0, kGridWidth -1);
+    int gcy = std::clamp((int)(_flowGoalY / cellSz), 0, kGridHeight-1);
+    int goalCell = gcx + gcy * kGridWidth;
+    blocked[goalCell] = false;   // goal cell is always reachable
+    cost[goalCell]    = 0.f;
+
+    using PQ = std::priority_queue<std::pair<float,int>,
+                                   std::vector<std::pair<float,int>>,
+                                   std::greater<std::pair<float,int>>>;
+    PQ pq;
+    pq.push({0.f, goalCell});
+
+    while (!pq.empty()) {
+        auto [d, c] = pq.top(); pq.pop();
+        if (d > cost[c]) continue;
+        int cx = c % kGridWidth, cy = c / kGridWidth;
+        for (int i = 0; i < 8; i++) {
+            int nx = cx+NDX[i], ny = cy+NDY[i];
+            if (nx < 0 || nx >= kGridWidth || ny < 0 || ny >= kGridHeight) continue;
+            int nc = nx + ny*kGridWidth;
+            if (blocked[nc]) continue;
+            // Prevent diagonal movement through blocked corners
+            if (NDX[i] != 0 && NDY[i] != 0)
+                if (blocked[(cx+NDX[i]) + cy*kGridWidth] ||
+                    blocked[cx + (cy+NDY[i])*kGridWidth]) continue;
+            float nd = d + NDC[i];
+            if (nd < cost[nc]) { cost[nc] = nd; pq.push({nd, nc}); }
+        }
+    }
+
+    // ── Derive flow vectors: steepest descent on cost field ───────────────
+    struct FlowVec { float x, y; };
+    FlowVec *ff = (FlowVec *)_flowFieldBuffer.contents;
+
+    for (int c = 0; c < kNumCells; c++) {
+        if (blocked[c] || cost[c] >= 1e29f) { ff[c] = {0.f,0.f}; continue; }
+        int cx = c % kGridWidth, cy = c / kGridWidth;
+        float best = cost[c];
+        float bx = 0.f, by = 0.f;
+        for (int i = 0; i < 8; i++) {
+            int nx = cx+NDX[i], ny = cy+NDY[i];
+            if (nx < 0 || nx >= kGridWidth || ny < 0 || ny >= kGridHeight) continue;
+            if (cost[nx + ny*kGridWidth] < best) {
+                best = cost[nx + ny*kGridWidth];
+                bx = (float)NDX[i];
+                by = (float)NDY[i];
+            }
+        }
+        float len = std::sqrtf(bx*bx + by*by);
+        ff[c] = len > 0.f ? FlowVec{bx/len, by/len} : FlowVec{0.f,0.f};
+    }
 }
 
 // ── Per-frame encode ──────────────────────────────────────────────────────────
 
 - (void)encodeToCommandBuffer:(id<MTLCommandBuffer>)cmd dt:(float)dt {
     if (!_integratePipeline) return;
+
+    // Recompute flow field if obstacles changed since last encode
+    if (_flowFieldDirty) {
+        [self recomputeFlowField];
+        _flowFieldDirty = NO;
+    }
 
     SimParams *p  = (SimParams *)_params.contents;
     p->dt         = dt;
@@ -298,10 +447,12 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
-        // Pass 6 — grid steering (sequential reads via sorted SoA)
+        // Pass 6 — steering: k_orca (velocity-space LP) or k_steerGrid (flocking)
         {
+            id<MTLComputePipelineState> steerPS =
+                (_useORCA && _orcaPipeline) ? _orcaPipeline : _steerGridPipeline;
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:_steerGridPipeline];
+            [enc setComputePipelineState:steerPS];
             [enc setBuffer:_sPosX            offset:0 atIndex:0];
             [enc setBuffer:_sPosY            offset:0 atIndex:1];
             [enc setBuffer:_sVelX            offset:0 atIndex:2];
@@ -316,6 +467,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc setBuffer:_sortedAgentIndex offset:0 atIndex:11];
             [enc setBuffer:_params           offset:0 atIndex:12];
             [enc setBuffer:_obstacleBuffer   offset:0 atIndex:13];
+            [enc setBuffer:_flowFieldBuffer  offset:0 atIndex:14];
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
