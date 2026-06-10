@@ -316,6 +316,24 @@ At low agent counts (< ~25K), cells have fewer than 64 agents and a threadgroup 
 
 Both are well under the 32 KB Metal threadgroup memory limit, leaving headroom for the compiler to allocate additional TGSM for other variables.
 
+**Benchmark results (Apple M3):**
+
+```
+                               1K     5K    10K    50K   100K   250K   500K
+Spat.Hash  No Tile [Ph.3]    0.60  0.61  0.79  1.94   6.47  37.4   147
+Spat.Hash  Tiled   [Ph.3+7]  0.23  0.25  0.31  1.93   6.59  38.5   153
+
+Tiling speedup:              2.61× 2.41× 2.56× 1.00×  0.98× 0.97×  0.96×
+```
+
+_Analysis:_ The result contradicts the CUDA intuition that tiling always wins, and the reason is architectural.
+
+**Why tiling is 2.5× faster at 1K–10K:** With very few agents the working set is tiny and cells are sparsely occupied. Each threadgroup's 64 threads have different neighbors in different grid cells — the untiled path scatters reads across device memory with no spatial locality. The tiled kernel eliminates this by having each thread issue only one global load per tile iteration (its own lane) while the rest of the neighborhood comes from fast TGSM. The cooperative load pattern also improves SIMD occupancy: every lane does identical work on the same tile, so no thread stalls waiting for a divergent neighbor list to finish.
+
+**Why tiling breaks even or regresses at 50K–500K:** The M3's GPU L2 cache is large relative to the working set at these densities. The `k_reorder` pass (Phase 3) already writes agent data in sorted-by-cell order, so every subsequent global read during the 3×3 neighborhood scan hits a nearly sequential address range — exactly the access pattern L2 prefetchers are designed to exploit. By the time the tiled kernel calls `threadgroup_barrier`, the untiled kernel has already loaded the same data from L2 at comparable bandwidth. The barrier overhead (~few μs per tile boundary) then adds up across the grid, producing the observed ~3% regression at 500K.
+
+**The underlying lesson:** Tiling exists to paper over the gap between register/shared memory bandwidth and off-chip DRAM bandwidth on discrete GPUs. On Apple Silicon the unified memory architecture blurs this boundary — the GPU L2 is physically adjacent to the compute cores and large enough (relative to typical working sets) to capture the reuse that TGSM would otherwise provide. The `k_reorder` sort doubles down on this: it transforms scattered reads into sequential ones, making L2 prefetching nearly perfect. TGSM tiling is still beneficial when the working set genuinely overflows L2 (sub-10K agents in this sim, or arbitrarily large neighborhoods in other workloads), but it is not a universal win on this hardware.
+
 ---
 
 ## Project Structure

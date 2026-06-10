@@ -12,6 +12,8 @@
 
 static const uint32_t kAgentCounts[]  = {1'000, 5'000, 10'000, 50'000, 100'000, 250'000};
 static const int      kNumCounts      = 6;
+static const uint32_t kTilingCounts[] = {1'000, 5'000, 10'000, 50'000, 100'000, 250'000, 500'000};
+static const int      kNumTilingCounts = 7;
 static const uint32_t kCPUThreads[]   = {1, 2, 4, 8};
 static const int      kNumCPUScenarios = 4;
 static const int      kWarmupFrames   = 10;
@@ -51,11 +53,13 @@ static double benchmarkCPU(uint32_t agentCount, uint32_t numThreads) {
 static double benchmarkGPU(id<MTLDevice> device,
                            id<MTLLibrary> library,
                            uint32_t agentCount,
-                           BOOL useGrid) {
+                           BOOL useGrid,
+                           BOOL useTiling = YES) {
     GPUSimulation *sim = [[GPUSimulation alloc] initWithDevice:device
                                                        library:library
                                                     agentCount:agentCount];
     sim.useGridSteering = useGrid;
+    sim.useTiling       = useTiling;
     id<MTLCommandQueue> queue = [device newCommandQueue];
 
     for (int f = 0; f < kWarmupFrames; f++) {
@@ -153,7 +157,7 @@ int runBenchmark(id<MTLDevice> device, id<MTLLibrary> library) {
         for (int c = 0; c < kNumCounts; c++) {
             if (bailed) { results[row][c] = NAN; continue; }
             printf("    %6u agents ... ", kAgentCounts[c]); fflush(stdout);
-            double ms = benchmarkGPU(device, library, kAgentCounts[c], gpuGrid[g]);
+            double ms = benchmarkGPU(device, library, kAgentCounts[c], gpuGrid[g], YES);
             results[row][c] = ms;
             if (std::isnan(ms)) { printf("bailed\n"); bailed = true; }
             else                  printf("%.2f ms\n", ms);
@@ -222,5 +226,81 @@ int runBenchmark(id<MTLDevice> device, id<MTLLibrary> library) {
     }
 
     printf("\n");
+    return 0;
+}
+
+// ── Tiling benchmark: GPU spatial hash, untiled vs tiled, up to 500K agents ──
+
+int runTilingBenchmark(id<MTLDevice> device, id<MTLLibrary> library) {
+    static const int kRows = 2;
+    double results[kRows][kNumTilingCounts];
+    for (int r = 0; r < kRows; r++)
+        for (int c = 0; c < kNumTilingCounts; c++)
+            results[r][c] = 0.0;
+
+    printf("\n");
+    printf("================================================================\n");
+    printf("  CrowdSim — Tiling Benchmark (Phase 3 vs Phase 3 + Tiling)\n");
+    printf("  %s\n", device.name.UTF8String);
+    printf("  %d warmup + %d measurement frames  |  bail threshold: %.0f ms\n",
+           kWarmupFrames, kMeasureFrames, kBailMs);
+    printf("================================================================\n\n");
+
+    const char *names[] = { "Spat.Hash  No Tile [Ph.3]",
+                             "Spat.Hash  Tiled   [Ph.3+7]" };
+    BOOL        tiling[] = { NO, YES };
+
+    for (int r = 0; r < kRows; r++) {
+        printf("  %s ...\n", names[r]);
+        fflush(stdout);
+        bool bailed = false;
+        for (int c = 0; c < kNumTilingCounts; c++) {
+            if (bailed) { results[r][c] = NAN; continue; }
+            printf("    %6u agents ... ", kTilingCounts[c]); fflush(stdout);
+            double ms = benchmarkGPU(device, library, kTilingCounts[c], YES, tiling[r]);
+            results[r][c] = ms;
+            if (std::isnan(ms)) { printf("bailed\n"); bailed = true; }
+            else                  printf("%.2f ms\n", ms);
+        }
+    }
+
+    printf("\n");
+    printf("================================================================\n");
+    printf("  Frame time (ms)  ·  lower is better  ·  16.7 ms = 60 FPS\n");
+    printf("================================================================\n");
+
+    printf("  %-28s", "");
+    for (int c = 0; c < kNumTilingCounts; c++) {
+        uint32_t n = kTilingCounts[c];
+        char buf[10];
+        if      (n >= 1'000'000) snprintf(buf, sizeof(buf), " %4uM", n / 1'000'000);
+        else if (n >= 1'000)     snprintf(buf, sizeof(buf), " %3uK",  n / 1'000);
+        else                     snprintf(buf, sizeof(buf), " %4u",   n);
+        printf(" %6s", buf);
+    }
+    printf("\n");
+
+    printf("  %-28s", "");
+    for (int c = 0; c < kNumTilingCounts; c++) printf(" ------");
+    printf("\n");
+
+    for (int r = 0; r < kRows; r++) {
+        printf("  %-28s", names[r]);
+        for (int c = 0; c < kNumTilingCounts; c++)
+            printf("%s", cell(results[r][c]).c_str());
+        printf("\n");
+    }
+    printf("================================================================\n");
+
+    // Speedup row
+    printf("\n  Tiling speedup (No Tile / Tiled):\n");
+    printf("  %-28s", "");
+    for (int c = 0; c < kNumTilingCounts; c++) {
+        double base = results[0][c], tiled = results[1][c];
+        if (std::isnan(base) || std::isnan(tiled)) { printf("    —  "); continue; }
+        char buf[16]; snprintf(buf, sizeof(buf), " %4.2f×", base / tiled);
+        printf("%7s", buf);
+    }
+    printf("\n\n");
     return 0;
 }

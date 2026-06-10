@@ -20,6 +20,8 @@
 @property (nonatomic)            BOOL          useFlowField;
 // YES = k_orca replaces k_steerGrid; agents use velocity-space LP for collision avoidance.
 @property (nonatomic)            BOOL          useORCA;
+// YES (default) = tiled k_steerGrid with threadgroup memory; NO = untiled baseline.
+@property (nonatomic)            BOOL          useTiling;
 @property (nonatomic, readonly)  BOOL          flowGoalSet;
 @property (nonatomic, readonly)  float         flowGoalX;
 @property (nonatomic, readonly)  float         flowGoalY;

@@ -31,6 +31,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     // Phase 7 — ORCA collision avoidance (replaces k_steerGrid when active)
     id<MTLComputePipelineState> _orcaPipeline;
     BOOL                        _useORCA;
+    // Tiling benchmark — untiled baseline kept for comparison
+    id<MTLComputePipelineState> _noTiledPipeline;
+    BOOL                        _useTiling;
 
     // SoA agent data — shared storage; CPU writes once at init, GPU owns thereafter
     id<MTLBuffer> _posX, _posY;
@@ -92,6 +95,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _device          = device;
     _agentCount      = count;
     _useGridSteering = YES;
+    _useTiling       = YES;
     [self buildPipelines:library];
     [self allocateAndInitBuffers];
     return self;
@@ -119,7 +123,8 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _scatterPipeline   = [self pipelineNamed:@"k_scatter"   library:library];
     _reorderPipeline   = [self pipelineNamed:@"k_reorder"   library:library];
     _steerGridPipeline = [self pipelineNamed:@"k_steerGrid" library:library];
-    _orcaPipeline      = [self pipelineNamed:@"k_orca"      library:library];
+    _orcaPipeline      = [self pipelineNamed:@"k_orca"           library:library];
+    _noTiledPipeline   = [self pipelineNamed:@"k_steerGrid_notiled" library:library];
 }
 
 // ── Buffer allocation + CPU initialisation ────────────────────────────────────
@@ -263,6 +268,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _useORCA = on;
     ((SimParams *)_params.contents)->useORCA = on ? 1 : 0;
 }
+
+- (BOOL)useTiling { return _useTiling; }
+- (void)setUseTiling:(BOOL)on { _useTiling = on; }
 
 - (void)setFlowFieldGoal:(float)x y:(float)y {
     _flowGoalX   = x;
@@ -447,10 +455,15 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
-        // Pass 6 — steering: k_orca (velocity-space LP) or k_steerGrid (flocking)
+        // Pass 6 — steering: ORCA, tiled grid, or untiled grid
         {
-            id<MTLComputePipelineState> steerPS =
-                (_useORCA && _orcaPipeline) ? _orcaPipeline : _steerGridPipeline;
+            id<MTLComputePipelineState> steerPS;
+            if (_useORCA && _orcaPipeline)
+                steerPS = _orcaPipeline;
+            else if (!_useTiling && _noTiledPipeline)
+                steerPS = _noTiledPipeline;
+            else
+                steerPS = _steerGridPipeline;
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:steerPS];
             [enc setBuffer:_sPosX            offset:0 atIndex:0];

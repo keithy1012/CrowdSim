@@ -555,6 +555,123 @@ kernel void k_steerGrid(
     forceY[oi] = fy;
 }
 
+// Untiled reference kernel — original k_steerGrid without threadgroup memory.
+// Used only by the tiling benchmark to measure the baseline.
+kernel void k_steerGrid_notiled(
+    device const float    *sPosX            [[buffer(0)]],
+    device const float    *sPosY            [[buffer(1)]],
+    device const float    *sVelX            [[buffer(2)]],
+    device const float    *sVelY            [[buffer(3)]],
+    device const float    *sMaxSpeed        [[buffer(4)]],
+    device float          *targetX          [[buffer(5)]],
+    device float          *targetY          [[buffer(6)]],
+    device float          *forceX           [[buffer(7)]],
+    device float          *forceY           [[buffer(8)]],
+    device const uint     *cellStart        [[buffer(9)]],
+    device const uint     *cellCount        [[buffer(10)]],
+    device const uint     *sortedAgentIndex [[buffer(11)]],
+    constant SimParams    &p               [[buffer(12)]],
+    device const Obstacle *obstacles       [[buffer(13)]],
+    device const float2   *flowField       [[buffer(14)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+
+    float px = sPosX[gid];
+    float py = sPosY[gid];
+    float ms = sMaxSpeed[gid];
+    uint  oi = sortedAgentIndex[gid];
+
+    float fx = 0.f, fy = 0.f;
+
+    int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
+    int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
+
+    if (p.useFlowField) {
+        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+        fx += p.weightSeek * dir.x * ms;
+        fy += p.weightSeek * dir.y * ms;
+    } else {
+        float gdx = targetX[oi] - px;
+        float gdy = targetY[oi] - py;
+        float gd2 = gdx * gdx + gdy * gdy;
+        if (gd2 < p.arrivalRadius2) {
+            uint seed   = wang_hash(oi ^ (uint)(p.frameIndex) * 2654435761u);
+            targetX[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldWidth;
+            seed        = wang_hash(seed);
+            targetY[oi] = (float)(seed & 0xFFFFu) / 65535.f * p.worldHeight;
+        } else {
+            float inv = ms / sqrt(gd2);
+            fx += p.weightSeek * gdx * inv;
+            fy += p.weightSeek * gdy * inv;
+        }
+    }
+
+    float sepX = 0.f, sepY = 0.f, aliVX = 0.f, aliVY = 0.f;
+    float cohX = 0.f, cohY = 0.f;
+    int   count = 0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        int ny = agCellY + dy;
+        if (ny < 0 || ny >= p.gridHeight) continue;
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = agCellX + dx;
+            if (nx < 0 || nx >= p.gridWidth) continue;
+            uint cid   = (uint)(nx + ny * p.gridWidth);
+            uint start = cellStart[cid];
+            uint end   = start + cellCount[cid];
+            for (uint k = start; k < end; k++) {
+                if (k == gid) continue;
+                float ndx = sPosX[k] - px;
+                float ndy = sPosY[k] - py;
+                float nd2 = ndx * ndx + ndy * ndy;
+                if (nd2 > p.neighborRadius2) continue;
+                float nd = sqrt(nd2);
+                if (nd2 < p.separationRadius2 && nd > 0.001f) {
+                    float strength = (p.separationRadius - nd) / p.separationRadius;
+                    sepX -= (ndx / nd) * strength;
+                    sepY -= (ndy / nd) * strength;
+                }
+                aliVX += sVelX[k]; aliVY += sVelY[k];
+                cohX  += sPosX[k]; cohY  += sPosY[k];
+                count++;
+            }
+        }
+    }
+
+    fx += p.weightSep * sepX;
+    fy += p.weightSep * sepY;
+    if (count > 0) {
+        float inv = 1.f / (float)count;
+        fx += p.weightAlign * aliVX * inv;
+        fy += p.weightAlign * aliVY * inv;
+        float cdx = cohX * inv - px, cdy = cohY * inv - py;
+        float cd  = length(float2(cdx, cdy));
+        if (cd > 0.001f) {
+            fx += p.weightCohere * (cdx / cd) * ms;
+            fy += p.weightCohere * (cdy / cd) * ms;
+        }
+    }
+
+    float avoidR = p.obstacleAvoidRadius;
+    for (int oi2 = 0; oi2 < p.obstacleCount; oi2++) {
+        float2 A = float2(obstacles[oi2].x0, obstacles[oi2].y0);
+        float2 B = float2(obstacles[oi2].x1, obstacles[oi2].y1);
+        float2 AB = B - A, AP = float2(px, py) - A;
+        float  t  = clamp(dot(AP, AB) / dot(AB, AB), 0.f, 1.f);
+        float2 repulse = float2(px, py) - (A + t * AB);
+        float  dist    = length(repulse);
+        if (dist < avoidR && dist > 0.001f) {
+            float strength = (avoidR - dist) / avoidR;
+            fx += 3.f * ms * strength * (repulse.x / dist);
+            fy += 3.f * ms * strength * (repulse.y / dist);
+        }
+    }
+
+    forceX[oi] = fx;
+    forceY[oi] = fy;
+}
+
 // ── Phase 7: ORCA (Optimal Reciprocal Collision Avoidance) ────────────────────
 //
 // Implements the RVO2 algorithm: for each pair of nearby agents, one ORCA half-plane
