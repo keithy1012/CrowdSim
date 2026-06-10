@@ -10,6 +10,7 @@ static const uint32_t kMaxAgentsCPU = 50000;
 - (void)buildAgentPipelineWithView:(MTKView *)view;
 - (void)buildObstaclePipelineWithView:(MTKView *)view;
 - (void)buildGoalPipelineWithView:(MTKView *)view;
+- (void)buildExitPipelineWithView:(MTKView *)view;
 @end
 
 @implementation Renderer {
@@ -19,6 +20,10 @@ static const uint32_t kMaxAgentsCPU = 50000;
     id<MTLRenderPipelineState> _agentPipeline;
     id<MTLRenderPipelineState> _obstaclePipeline;
     id<MTLRenderPipelineState> _goalPipeline;
+    id<MTLRenderPipelineState> _exitPipeline;
+
+    // Per-agent all-ones active buffer for normal (non-evacuation) CPU path
+    id<MTLBuffer> _allActiveBuffer;
 
     // CPU-path render buffers (separate SoA, matches shader buffer layout)
     id<MTLBuffer> _posXBuffer;
@@ -59,6 +64,7 @@ static const uint32_t kMaxAgentsCPU = 50000;
         [self buildAgentPipelineWithView:view];
         [self buildObstaclePipelineWithView:view];
         [self buildGoalPipelineWithView:view];
+        [self buildExitPipelineWithView:view];
     }
 
     NSUInteger sz = kMaxAgentsCPU * sizeof(float);
@@ -77,6 +83,11 @@ static const uint32_t kMaxAgentsCPU = 50000;
     float *msPtr = (float *)_cpuMaxSpeedBuffer.contents;
     for (uint32_t i = 0; i < kMaxAgentsCPU; i++) msPtr[i] = 1.f;
 
+    // Fallback active buffer for CPU path (all agents alive)
+    _allActiveBuffer = [_device newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    float *actPtr = (float *)_allActiveBuffer.contents;
+    for (uint32_t i = 0; i < kMaxAgentsCPU; i++) actPtr[i] = 1.f;
+
     view.clearColor               = MTLClearColorMake(0.05, 0.05, 0.10, 1.0);
     view.preferredFramesPerSecond = 60;
 
@@ -94,6 +105,24 @@ static const uint32_t kMaxAgentsCPU = 50000;
     NSError *err = nil;
     _goalPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
     if (err) NSLog(@"[Renderer] Goal pipeline error: %@", err);
+}
+
+- (void)buildExitPipelineWithView:(MTKView *)view {
+    id<MTLFunction> vsFn = [_library newFunctionWithName:@"vs_exit"];
+    id<MTLFunction> fsFn = [_library newFunctionWithName:@"fs_exit"];
+    if (!vsFn || !fsFn) { NSLog(@"[Renderer] vs_exit / fs_exit not found."); return; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction               = vsFn;
+    pd.fragmentFunction             = fsFn;
+    pd.colorAttachments[0].pixelFormat  = view.colorPixelFormat;
+    pd.colorAttachments[0].blendingEnabled             = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor        = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].destinationRGBBlendFactor   = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor      = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    NSError *err = nil;
+    _exitPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (err) NSLog(@"[Renderer] Exit pipeline error: %@", err);
 }
 
 - (void)buildObstaclePipelineWithView:(MTKView *)view {
@@ -193,13 +222,14 @@ static const uint32_t kMaxAgentsCPU = 50000;
                                   : (_sim ? (uint32_t)_sim->agents().count() : 0);
 
     if (_agentPipeline && agentCount > 0) {
-        // GPU sim owns its position/velocity buffers; CPU path uses local staging buffers
-        id<MTLBuffer> pxBuf = _gpuSim ? _gpuSim.posXBuffer     : _posXBuffer;
-        id<MTLBuffer> pyBuf = _gpuSim ? _gpuSim.posYBuffer     : _posYBuffer;
-        id<MTLBuffer> rBuf  = _gpuSim ? _gpuSim.radBuffer      : _radBuffer;
-        id<MTLBuffer> vxBuf = _gpuSim ? _gpuSim.velXBuffer     : _cpuVelXBuffer;
-        id<MTLBuffer> vyBuf = _gpuSim ? _gpuSim.velYBuffer     : _cpuVelYBuffer;
-        id<MTLBuffer> msBuf = _gpuSim ? _gpuSim.maxSpeedBuffer : _cpuMaxSpeedBuffer;
+        id<MTLBuffer> pxBuf  = _gpuSim ? _gpuSim.posXBuffer     : _posXBuffer;
+        id<MTLBuffer> pyBuf  = _gpuSim ? _gpuSim.posYBuffer     : _posYBuffer;
+        id<MTLBuffer> rBuf   = _gpuSim ? _gpuSim.radBuffer      : _radBuffer;
+        id<MTLBuffer> vxBuf  = _gpuSim ? _gpuSim.velXBuffer     : _cpuVelXBuffer;
+        id<MTLBuffer> vyBuf  = _gpuSim ? _gpuSim.velYBuffer     : _cpuVelYBuffer;
+        id<MTLBuffer> msBuf  = _gpuSim ? _gpuSim.maxSpeedBuffer : _cpuMaxSpeedBuffer;
+        // Active buffer: GPU sim's own buffer; CPU path uses all-ones fallback
+        id<MTLBuffer> actBuf = _gpuSim ? _gpuSim.activeBuffer   : _allActiveBuffer;
 
         [enc setRenderPipelineState:_agentPipeline];
         [enc setVertexBuffer:pxBuf     offset:0 atIndex:0];
@@ -209,13 +239,25 @@ static const uint32_t kMaxAgentsCPU = 50000;
         [enc setVertexBuffer:vxBuf     offset:0 atIndex:4];
         [enc setVertexBuffer:vyBuf     offset:0 atIndex:5];
         [enc setVertexBuffer:msBuf     offset:0 atIndex:6];
+        [enc setVertexBuffer:actBuf    offset:0 atIndex:7];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
                 vertexStart:0
                 vertexCount:4
               instanceCount:agentCount];
     }
 
-    // Draw obstacle line segments on top of agents
+    // Draw exit zones (evacuation mode)
+    if (_exitPipeline && _gpuSim && _gpuSim.evacExitCount > 0) {
+        [enc setRenderPipelineState:_exitPipeline];
+        [enc setVertexBuffer:_gpuSim.evacExitBuffer offset:0 atIndex:0];
+        [enc setVertexBuffer:_vpBuffer              offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                vertexStart:0
+                vertexCount:4
+              instanceCount:_gpuSim.evacExitCount];
+    }
+
+    // Draw obstacle line segments
     if (_obstaclePipeline && _gpuSim && _gpuSim.obstacleCount > 0) {
         [enc setRenderPipelineState:_obstaclePipeline];
         [enc setVertexBuffer:_gpuSim.obstacleBuffer offset:0 atIndex:0];
@@ -225,8 +267,9 @@ static const uint32_t kMaxAgentsCPU = 50000;
                 vertexCount:_gpuSim.obstacleCount * 2];
     }
 
-    // Draw flow field goal marker (drawn last so it always appears on top)
-    if (_goalPipeline && _gpuSim && _gpuSim.flowGoalSet && _gpuSim.useFlowField) {
+    // Draw flow field goal marker (normal mode only)
+    if (_goalPipeline && _gpuSim && _gpuSim.flowGoalSet && _gpuSim.useFlowField
+            && _gpuSim.evacExitCount == 0) {
         float goal[2] = { _gpuSim.flowGoalX, _gpuSim.flowGoalY };
         [enc setRenderPipelineState:_goalPipeline];
         [enc setVertexBytes:goal length:sizeof(goal) atIndex:0];

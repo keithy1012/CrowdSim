@@ -309,10 +309,10 @@ At low agent counts (< ~25K), cells have fewer than 64 agents and a threadgroup 
 
 **Threadgroup memory footprint:**
 
-| Kernel        | Arrays                   | Size per threadgroup |
-| ------------- | ------------------------ | -------------------- |
-| `k_steerGrid` | posX/Y + velX/Y + maxSpd | 1,288 B              |
-| `k_orca`      | posX/Y + velX/Y          | 1,032 B              |
+| Kernel        | Arrays                            | Size per threadgroup |
+| ------------- | --------------------------------- | -------------------- |
+| `k_steerGrid` | posX/Y + velX/Y + maxSpd + active | 1,536 B              |
+| `k_orca`      | posX/Y + velX/Y + active          | 1,280 B              |
 
 Both are well under the 32 KB Metal threadgroup memory limit, leaving headroom for the compiler to allocate additional TGSM for other variables.
 
@@ -343,14 +343,26 @@ CrowdSim/
 ├── CMakeLists.txt          — Build system
 ├── src/
 │   ├── Agent.h             — SoA agent buffer layout
-│   ├── SharedTypes.h       — SimParams struct (shared by C++ and Metal)
+│   ├── SharedTypes.h       — SimParams, Obstacle, EvacExit structs (shared by C++ and Metal)
 │   ├── Simulation.h/.cpp   — CPU steering loop (Phase 1 / Phase 4 benchmarking)
-│   ├── GPUSimulation.h/.mm — Metal buffers, k_steer + k_integrate pipelines
-│   ├── main.mm             — App entry point
-│   ├── AppDelegate.h/.mm   — Window, MTKView, GPUSimulation setup
-│   └── Renderer.h/.mm      — CPU + GPU render paths, instanced draw
+│   ├── GPUSimulation.h/.mm — All GPU passes, evacuation API, multi-source flow field
+│   ├── Benchmark.h/.mm     — Phase 4 + tiling benchmark harness
+│   ├── main.mm             — App entry point; routes --benchmark / --benchmark-tiling
+│   ├── AppDelegate.h/.mm   — Window, MTKView, normal + evacuation mode state machine
+│   └── Renderer.h/.mm      — CPU + GPU render paths, exit zone rendering
 ├── shaders/
-│   └── Shaders.metal       — vs_agent / fs_agent, k_steer, k_integrate
+│   └── Shaders.metal       — All vertex, fragment, and compute kernels:
+│                             vs_agent / fs_agent       — instanced agent circles
+│                             vs_obstacle / fs_obstacle  — wall line segments
+│                             vs_goal / fs_goal          — flow-field goal marker
+│                             vs_exit / fs_exit          — evacuation exit zones (blended rings)
+│                             k_steer                    — Phase 2 O(N²) steering
+│                             k_integrate                — velocity + position integration
+│                             k_clearGrid / k_hash / k_prefixSum / k_scatter / k_reorder
+│                             k_steerGrid                — tiled spatial-hash steering
+│                             k_steerGrid_notiled        — untiled baseline (benchmark only)
+│                             k_orca                     — ORCA velocity-space LP
+│                             k_checkExit                — evacuation exit detection
 └── .vscode/
     ├── tasks.json          — Build / Run tasks
     ├── launch.json         — LLDB debug configuration
@@ -403,7 +415,7 @@ build/CrowdSim.app/Contents/MacOS/CrowdSim --benchmark
 
 Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 6 agent counts and prints a formatted results table.
 
-**Controls**
+**Controls — Normal mode**
 
 | Input           | Action                                                                                  |
 | --------------- | --------------------------------------------------------------------------------------- |
@@ -413,53 +425,219 @@ Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 
 | `F`             | Toggle flow-field navigation (agents seek a shared goal vs. random wandering)           |
 | `O`             | Toggle ORCA collision avoidance (replaces heuristic separation with LP-based avoidance) |
 | `C`             | Clear drawn segments, restore current scene's preset obstacles                          |
+| `E`             | Enter evacuation mode                                                                   |
+
+**Controls — Evacuation mode** (press `E` to enter)
+
+| Input           | Action                                                                     |
+| --------------- | -------------------------------------------------------------------------- |
+| Left-click drag | Draw wall segments (leave gaps at doorways for exits)                      |
+| Right-click     | Place an exit zone (green ring, 50 px radius) at cursor position           |
+| `+` / `-`       | Increase / decrease spawn count by 100 (shown in title bar)                |
+| `Space`         | Spawn agents and start evacuation                                          |
+| `R`             | Reset: clear agents, keep walls and exits, ready for another run           |
+| `C`             | Clear all walls and exits (reload current preset scene)                    |
+| `1` / `2` / `3` | Load a preset scene as starting layout                                     |
+| `E`             | Exit evacuation mode, return to normal flocking                            |
 
 ---
 
 ## Project Outline
 
-| Phase   | Focus                                    | Agent Target   | Status   |
-| ------- | ---------------------------------------- | -------------- | -------- |
-| 0       | Project setup, render loop, build system | —              | Complete |
-| 1       | CPU prototype, steering behaviors        | 10K @ 60 FPS   | Complete |
-| 2       | GPU compute port (Metal)                 | 50K @ 60 FPS   | Complete |
-| 3       | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
-| 4       | CPU vs GPU benchmarking suite            | 100K+          | Complete |
-| 5       | Obstacle avoidance + crowd scenarios     | 100K @ 60 FPS  | Complete |
-| 6       | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Complete |
-| Stretch | 500K+ agents, GPU profiling dashboard    | 500K+ @ 60 FPS | Planned  |
+| Phase     | Focus                                        | Agent Target   | Status   |
+| --------- | -------------------------------------------- | -------------- | -------- |
+| 0         | Project setup, render loop, build system     | —              | Complete |
+| 1         | CPU prototype, steering behaviors            | 10K @ 60 FPS   | Complete |
+| 2         | GPU compute port (Metal)                     | 50K @ 60 FPS   | Complete |
+| 3         | Spatial hashing + GPU neighbor search        | 100K @ 60 FPS  | Complete |
+| 4         | CPU vs GPU benchmarking suite                | 100K+          | Complete |
+| 5         | Obstacle avoidance + crowd scenarios         | 100K @ 60 FPS  | Complete |
+| 6         | Flow fields and ORCA navigation              | 250K+ @ 60 FPS | Complete |
+| Stretch 1 | 500K+ agents, threadgroup memory tiling      | 500K+ @ 60 FPS | Complete |
+| Stretch 2 | Evacuation safety simulator                  | —              | Complete |
 
 ---
 
-## Stretch Goal — Massive Scale and Profiling
+## Stretch Goal 1 — Massive Scale and Profiling (complete)
 
-**Target: 500K+ agents at 60 FPS.**
+**Target achieved: 500K agents rendered in real time.**
 
-Focus areas: memory bandwidth, GPU occupancy, workgroup sizing, cache efficiency.
+Threadgroup memory tiling (see Phase 6 tiling section above) was implemented and benchmarked across 1K–500K agents. Key result: 2.5× speedup at low agent counts from improved SIMD efficiency; neutral to slightly negative at 100K+ where the M3's GPU L2 cache already captures the reuse that TGSM provides. The `k_steerGrid_notiled` kernel is preserved as a benchmark baseline, selectable at runtime via `GPUSimulation.useTiling = NO`.
 
-**GPU profiling overlay:**
+Run the tiling benchmark:
 
+```bash
+build/CrowdSim.app/Contents/MacOS/CrowdSim --benchmark-tiling
 ```
-FPS            | 60
-Frame time     | 16.7 ms
-Agent count    | 500,000
-Compute time   | 11.2 ms
-  Grid build   |  1.1 ms
-  Neighbor     |  3.4 ms
-  Steering     |  4.8 ms
-  Integration  |  1.9 ms
-Render time    |  4.1 ms
-```
-
-Timing captured with `MTLCommandBuffer` completion handlers and a ring buffer of frame samples.
-
-**Long-term goal:** Build a simulation engine combining parallel computing, GPU programming, performance engineering, AI navigation, real-time rendering, and large-scale systems optimization.
 
 ---
 
-## Stretch Goal 2 - Stadium / Building Evacuation Safety Simulator
+## Stretch Goal 2 — Stadium / Building Evacuation Safety Simulator (complete)
 
-- Allow user to build out 2D maps with obstacle walls, set target entry/exit points, and let the simulation run with X agents. To get 3D representation, they can build multiple 2D laers
+A fully interactive evacuation planning mode built on top of the existing GPU simulation stack. The user draws a building layout, places exits, spawns a crowd, and watches agents evacuate while the engine collects performance metrics.
+
+Press **`E`** at any time to enter or exit evacuation mode without disturbing the normal flocking simulation.
+
+---
+
+### Workflow
+
+```
+E → enter evacuation mode
+  ↓
+Left-drag to draw walls (arena perimeter, corridors, pillars — same as normal obstacle drawing)
+  ↓
+Right-click to place exit zones (green circles, 50 px radius each; up to 8 exits)
+  ↓
++/- to set spawn count (default 500, steps of 100)
+  ↓
+Space → agents spawn, flow field computed, ORCA enabled, simulation starts
+  ↓
+Watch agents evacuate; live count shown in window title
+  ↓
+Last agent exits → metrics displayed: total time, average time, agents exited
+  ↓
+R → reset (keep layout, spawn again) or E → return to normal mode
+```
+
+**Evacuation mode controls:**
+
+| Input           | Action                                                                     |
+| --------------- | -------------------------------------------------------------------------- |
+| `E`             | Enter / exit evacuation mode                                               |
+| Left-click drag | Draw wall segments (same as normal mode; leave gaps at doorways)           |
+| Right-click     | Place exit zone (green ring) at cursor — each click adds one exit          |
+| `+` / `-`       | Increase / decrease spawn count by 100                                     |
+| `Space`         | Spawn agents and start evacuation                                          |
+| `R`             | Reset: clear agents, keep walls and exits, ready for another run           |
+| `C`             | Clear all walls and exits (reload current preset scene)                    |
+| `1` / `2` / `3` | Load preset scene as starting layout (also available in design phase)      |
+
+---
+
+### Architecture
+
+Four subsystems were added on top of the existing Phase 3–7 infrastructure. Everything reuses the spatial hash, ORCA, and flow field — no GPU passes were replaced, only extended.
+
+#### 1. Multi-source flow field
+
+The existing flow field BFS was extended from a single seed cell to an arbitrary number of seed cells. All exit zones are seeded simultaneously at cost 0; Dijkstra propagates outward normally. The result is that every grid cell routes toward its nearest exit — agents at a corridor junction automatically take the less congested door without any per-agent logic.
+
+```
+Before (single goal):
+    pq.push({0.f, goalCell})
+
+After (multi-source):
+    for each exit e:
+        gc = cell(e.x, e.y)
+        blocked[gc] = false          // exit cell always passable
+        pq.push({0.f, gc})           // all exits seeded simultaneously
+```
+
+The rest of the BFS and flow-vector derivation is unchanged. The fallback single-goal mode still works when no evacuation exits are placed.
+
+#### 2. Density-dependent speed (Henderson model)
+
+Agents slow down in dense crowds. During the 3×3 neighborhood scan that `k_steerGrid` and `k_orca` already perform, each agent counts how many neighbors fall within a density radius (default 30 px). A linear scale factor maps that count to a speed multiplier:
+
+```metal
+float speedFactor = clamp(1.f - (float)densCount / p.densityJamCount, 0.1f, 1.f);
+```
+
+`densityJamCount` defaults to 10: reaching 10 neighbors within 30 px reduces speed to 10% of maximum — the agent can still move but at a crawl. The 10% floor prevents complete deadlock at extreme density. This models the empirical pedestrian fundamental diagram (Weidmann, 1992): free-flow speed degrades linearly with density until jam density is reached. In `k_steerGrid`, the factor is applied to the final force output; in `k_orca`, it scales the preferred velocity before the LP runs.
+
+This adds zero cost to the neighbor scan — the density count piggybacks on the same `nd2 < densityRadius2` comparison.
+
+#### 3. Agent lifecycle — active flag
+
+Each agent carries a `float active` flag (1.0 = alive, 0.0 = exited). This flag is threaded through every GPU pass:
+
+| Pass | Change |
+|---|---|
+| `k_reorder` | Sorts `active → sActive` alongside the other SoA arrays |
+| `k_steerGrid` / `k_orca` | Loads `sActive` into `tgActive[64]` TGSM; skips inactive neighbors in the tile scan; skips force computation for inactive agents |
+| `k_integrate` | Returns immediately for inactive agents; uses position clamping instead of world-wrap |
+| `vs_agent` | Moves inactive agents' quad vertices to NDC (3,3) — outside the clip volume, zero fragment work |
+
+Inactive agents still participate in the spatial hash (they are hashed and sorted as usual) but are gated at the scan level, so their presence costs only one TGSM comparison per scan entry.
+
+#### 4. Exit detection — `k_checkExit`
+
+A new compute pass runs after `k_integrate` each frame (evacuation mode only). Each active agent checks its position against every exit zone:
+
+```metal
+for (int e = 0; e < p.exitCount; e++) {
+    float dx = posX[gid] - exits[e].x, dy = posY[gid] - exits[e].y;
+    if (dx*dx + dy*dy < exits[e].radius * exits[e].radius) {
+        active[gid]   = 0.f;
+        exitTime[gid] = (float)p.frameIndex;
+        atomic_fetch_sub_explicit(liveCount, 1u, memory_order_relaxed);
+        return;
+    }
+}
+```
+
+`liveCount` is a `device atomic_uint` buffer containing the number of agents still alive. It starts at the spawn count and counts down to 0. The CPU reads this buffer after each frame; when it reaches 0 the `evacuationCompleteCallback` block fires on the main thread.
+
+---
+
+### New GPU data
+
+| Buffer | Type | Size | Purpose |
+|---|---|---|---|
+| `_activeBuffer` | `float[N]` | 4N bytes | Per-agent alive flag (original order) |
+| `_sActive` | `float[N]` | 4N bytes | Sorted active flag (reorder output) |
+| `_exitTimeBuffer` | `float[N]` | 4N bytes | Frame index when each agent exited |
+| `_liveCountBuffer` | `atomic_uint[1]` | 4 bytes | Live-agent counter, decremented by `k_checkExit` |
+| `_exitBuffer` | `EvacExit[8]` | 128 bytes | Exit zone positions and radii |
+
+```c
+struct EvacExit {
+    float x, y, radius;
+    float _pad;   // 16-byte alignment
+};
+```
+
+New `SimParams` fields:
+
+```c
+int   evacuationMode;   // gates density scaling, active checks, no-wrap
+int   exitCount;        // number of live EvacExit entries
+float densityJamCount;  // neighbor count at which speed → 10% (default 10)
+float densityRadius2;   // squared density scan radius (default 30² = 900)
+```
+
+---
+
+### Evaluation metrics
+
+When the last agent exits, `GPUSimulation` computes metrics from the `exitTimeBuffer` via a single CPU-side O(N) scan:
+
+```objc
+typedef struct {
+    double   totalTimeSeconds;  // time from spawn to last agent exiting
+    double   avgTimeSeconds;    // mean exit time across all agents
+    uint32_t agentsSpawned;
+    uint32_t agentsExited;
+} EvacMetrics;
+```
+
+These are displayed in the window title and logged to the console. The `evacuationCompleteCallback` block also makes them available for any downstream analysis.
+
+---
+
+### Exit zone rendering
+
+A new `vs_exit` / `fs_exit` pipeline renders each exit as a green semi-transparent ring using the same instanced quad + circle SDF pattern as agents. Alpha blending is enabled on this pipeline so the ring composites correctly over agents and walls. The outer ring (`|uv| > 0.72`) renders at 85% alpha to clearly mark the exit boundary; the interior fill is at 20% alpha so wall and agent positions remain readable underneath.
+
+---
+
+### Design tips for evacuation scenarios
+
+- **Leave wall gaps at exits** — draw the boundary walls in two or more segments, leaving an opening where each exit circle sits. The exit zone's flow-field seed will pull agents toward the gap naturally.
+- **Multiple exits reveal bottlenecks** — place exits of equal size and observe whether agents concentrate at one. The multi-source flow field always routes to the *nearest* exit by grid distance; adding a second exit at the other end of a corridor splits the crowd and cuts total evacuation time.
+- **Use preset scenes as starting layouts** — press `2` (Barrier) or `3` (Pillars) before entering evacuation mode to start with a structured obstacle layout, then add exits and spawn agents without drawing anything.
+- **Agent count vs. density** — the default spawn count is 500. At 500 agents the density is low enough that the flow field dominates and agents stream cleanly. Increasing to 2000+ makes the density model visibly active: agents slow to a crawl at corridor bottlenecks before dispersing.
 
 ---
 

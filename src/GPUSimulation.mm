@@ -35,6 +35,19 @@ static const uint32_t kInitialObstacleCapacity = 64;
     id<MTLComputePipelineState> _noTiledPipeline;
     BOOL                        _useTiling;
 
+    // Evacuation mode
+    id<MTLComputePipelineState> _checkExitPipeline;
+    id<MTLBuffer> _activeBuffer;      // float[N]:  1.0 = alive, 0.0 = exited
+    id<MTLBuffer> _sActive;           // float[N]:  sorted active flag (reorder output)
+    id<MTLBuffer> _exitTimeBuffer;    // float[N]:  frame index when each agent exited
+    id<MTLBuffer> _liveCountBuffer;   // uint32_t[1]: atomic live-agent counter
+    id<MTLBuffer> _exitBuffer;        // EvacExit[kMaxEvacExits]
+    uint32_t      _evacExitCount;
+    BOOL          _evacuationMode;
+    BOOL          _evacuationComplete;
+    uint32_t      _evacSpawnCount;    // agents spawned in current run
+    int           _evacSpawnFrame;    // frame index at spawn time
+
     // SoA agent data — shared storage; CPU writes once at init, GPU owns thereafter
     id<MTLBuffer> _posX, _posY;
     id<MTLBuffer> _velX, _velY;
@@ -72,20 +85,25 @@ static const uint32_t kInitialObstacleCapacity = 64;
     int      _frameIndex;
 }
 
-@synthesize agentCount      = _agentCount;
-@synthesize obstacleCount   = _obstacleCount;
-@synthesize posXBuffer      = _posX;
-@synthesize posYBuffer      = _posY;
-@synthesize radBuffer       = _radBuffer;
-@synthesize velXBuffer      = _velX;
-@synthesize velYBuffer      = _velY;
-@synthesize maxSpeedBuffer  = _maxSpeed;
-@synthesize obstacleBuffer  = _obstacleBuffer;
-@synthesize useGridSteering = _useGridSteering;
-@synthesize flowGoalSet     = _flowGoalSet;
-@synthesize flowGoalX       = _flowGoalX;
-@synthesize flowGoalY       = _flowGoalY;
-// useFlowField has a custom setter (syncs SimParams), so no @synthesize
+@synthesize agentCount             = _agentCount;
+@synthesize obstacleCount          = _obstacleCount;
+@synthesize posXBuffer             = _posX;
+@synthesize posYBuffer             = _posY;
+@synthesize radBuffer              = _radBuffer;
+@synthesize velXBuffer             = _velX;
+@synthesize velYBuffer             = _velY;
+@synthesize maxSpeedBuffer         = _maxSpeed;
+@synthesize obstacleBuffer         = _obstacleBuffer;
+@synthesize activeBuffer           = _activeBuffer;
+@synthesize evacExitBuffer         = _exitBuffer;
+@synthesize evacExitCount          = _evacExitCount;
+@synthesize useGridSteering        = _useGridSteering;
+@synthesize flowGoalSet            = _flowGoalSet;
+@synthesize flowGoalX              = _flowGoalX;
+@synthesize flowGoalY              = _flowGoalY;
+@synthesize evacuationComplete     = _evacuationComplete;
+@synthesize evacuationCompleteCallback;
+// Custom getters/setters below: useFlowField, useORCA, useTiling, evacuationMode
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device
                        library:(id<MTLLibrary>)library
@@ -123,8 +141,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _scatterPipeline   = [self pipelineNamed:@"k_scatter"   library:library];
     _reorderPipeline   = [self pipelineNamed:@"k_reorder"   library:library];
     _steerGridPipeline = [self pipelineNamed:@"k_steerGrid" library:library];
-    _orcaPipeline      = [self pipelineNamed:@"k_orca"           library:library];
-    _noTiledPipeline   = [self pipelineNamed:@"k_steerGrid_notiled" library:library];
+    _orcaPipeline      = [self pipelineNamed:@"k_orca"               library:library];
+    _noTiledPipeline   = [self pipelineNamed:@"k_steerGrid_notiled"  library:library];
+    _checkExitPipeline = [self pipelineNamed:@"k_checkExit"          library:library];
 }
 
 // ── Buffer allocation + CPU initialisation ────────────────────────────────────
@@ -162,6 +181,22 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _sVelX     = [self sharedBuf:floatSz];
     _sVelY     = [self sharedBuf:floatSz];
     _sMaxSpeed = [self sharedBuf:floatSz];
+    _sActive   = [self sharedBuf:floatSz];
+
+    // Evacuation buffers — always allocated; active defaults to all-1 (everyone alive)
+    _activeBuffer   = [self sharedBuf:floatSz];
+    _exitTimeBuffer = [self sharedBuf:floatSz];
+    _liveCountBuffer= [self sharedBuf:sizeof(uint32_t)];
+    _exitBuffer     = [self sharedBuf:kMaxEvacExits * sizeof(struct EvacExit)];
+
+    float *act = (float *)_activeBuffer.contents;
+    for (uint32_t i = 0; i < _agentCount; i++) act[i] = 1.f;
+    memset(_exitTimeBuffer.contents, 0, floatSz);
+    *((uint32_t *)_liveCountBuffer.contents) = _agentCount;
+    memset(_exitBuffer.contents, 0, kMaxEvacExits * sizeof(struct EvacExit));
+    _evacExitCount   = 0;
+    _evacuationMode  = NO;
+    _evacuationComplete = NO;
 
     _obstacleCapacity = kInitialObstacleCapacity;
     _obstacleBuffer   = [self sharedBuf:_obstacleCapacity * sizeof(struct Obstacle)];
@@ -219,6 +254,10 @@ static const uint32_t kInitialObstacleCapacity = 64;
     p->useFlowField         = 0;
     p->useORCA              = 0;
     p->orcaTimeHorizon      = 1.5f;
+    p->evacuationMode       = 0;
+    p->exitCount            = 0;
+    p->densityJamCount      = 10.f;
+    p->densityRadius2       = 30.f * 30.f;
 }
 
 // ── Obstacle loading ──────────────────────────────────────────────────────────
@@ -272,6 +311,16 @@ static const uint32_t kInitialObstacleCapacity = 64;
 - (BOOL)useTiling { return _useTiling; }
 - (void)setUseTiling:(BOOL)on { _useTiling = on; }
 
+- (BOOL)evacuationMode { return _evacuationMode; }
+- (void)setEvacuationMode:(BOOL)on {
+    _evacuationMode = on;
+    ((SimParams *)_params.contents)->evacuationMode = on ? 1 : 0;
+}
+
+- (uint32_t)liveAgentCount {
+    return *((uint32_t *)_liveCountBuffer.contents);
+}
+
 - (void)setFlowFieldGoal:(float)x y:(float)y {
     _flowGoalX   = x;
     _flowGoalY   = y;
@@ -280,10 +329,11 @@ static const uint32_t kInitialObstacleCapacity = 64;
 }
 
 - (void)recomputeFlowField {
-    if (!_flowGoalSet) return;
+    // Requires at least one goal: either the traditional single goal or evac exits
+    if (!_flowGoalSet && _evacExitCount == 0) return;
 
-    const float cellSz = Simulation::kNeighborRadius;           // 50 px
-    const float blockR = cellSz * 0.5f;                        // block cells whose centres are within 25 px of an obstacle
+    const float cellSz = Simulation::kNeighborRadius;   // 50 px
+    const float blockR = cellSz * 0.5f;
 
     // ── Build blocked map ──────────────────────────────────────────────────
     bool blocked[kNumCells] = {};
@@ -306,7 +356,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
         }
     }
 
-    // ── Dijkstra (8-directional) from goal cell ────────────────────────────
+    // ── Dijkstra (8-directional) — multi-source seeding ───────────────────
     static const int   NDX[] = {-1, 0, 1,-1, 1,-1, 0, 1};
     static const int   NDY[] = {-1,-1,-1, 0, 0, 1, 1, 1};
     static const float NDC[] = {1.414f,1.f,1.414f,1.f,1.f,1.414f,1.f,1.414f};
@@ -314,17 +364,32 @@ static const uint32_t kInitialObstacleCapacity = 64;
     float cost[kNumCells];
     std::fill(cost, cost+kNumCells, 1e30f);
 
-    int gcx = std::clamp((int)(_flowGoalX / cellSz), 0, kGridWidth -1);
-    int gcy = std::clamp((int)(_flowGoalY / cellSz), 0, kGridHeight-1);
-    int goalCell = gcx + gcy * kGridWidth;
-    blocked[goalCell] = false;   // goal cell is always reachable
-    cost[goalCell]    = 0.f;
-
     using PQ = std::priority_queue<std::pair<float,int>,
                                    std::vector<std::pair<float,int>>,
                                    std::greater<std::pair<float,int>>>;
     PQ pq;
-    pq.push({0.f, goalCell});
+
+    // Seed from evacuation exits (multi-source: nearest exit wins)
+    if (_evacExitCount > 0) {
+        const struct EvacExit *ex = (const struct EvacExit *)_exitBuffer.contents;
+        for (uint32_t e = 0; e < _evacExitCount; e++) {
+            int gcx = std::clamp((int)(ex[e].x / cellSz), 0, kGridWidth -1);
+            int gcy = std::clamp((int)(ex[e].y / cellSz), 0, kGridHeight-1);
+            int gc  = gcx + gcy * kGridWidth;
+            blocked[gc] = false;   // exit cell always passable
+            if (cost[gc] > 0.f) { cost[gc] = 0.f; pq.push({0.f, gc}); }
+        }
+    }
+
+    // Single-goal fallback (non-evacuation flow field)
+    if (_flowGoalSet && _evacExitCount == 0) {
+        int gcx = std::clamp((int)(_flowGoalX / cellSz), 0, kGridWidth -1);
+        int gcy = std::clamp((int)(_flowGoalY / cellSz), 0, kGridHeight-1);
+        int gc  = gcx + gcy * kGridWidth;
+        blocked[gc] = false;
+        cost[gc]    = 0.f;
+        pq.push({0.f, gc});
+    }
 
     while (!pq.empty()) {
         auto [d, c] = pq.top(); pq.pop();
@@ -335,7 +400,6 @@ static const uint32_t kInitialObstacleCapacity = 64;
             if (nx < 0 || nx >= kGridWidth || ny < 0 || ny >= kGridHeight) continue;
             int nc = nx + ny*kGridWidth;
             if (blocked[nc]) continue;
-            // Prevent diagonal movement through blocked corners
             if (NDX[i] != 0 && NDY[i] != 0)
                 if (blocked[(cx+NDX[i]) + cy*kGridWidth] ||
                     blocked[cx + (cy+NDY[i])*kGridWidth]) continue;
@@ -365,6 +429,133 @@ static const uint32_t kInitialObstacleCapacity = 64;
         float len = std::sqrtf(bx*bx + by*by);
         ff[c] = len > 0.f ? FlowVec{bx/len, by/len} : FlowVec{0.f,0.f};
     }
+}
+
+// ── Evacuation API ────────────────────────────────────────────────────────────
+
+- (void)addEvacExit:(float)x y:(float)y radius:(float)radius {
+    if (_evacExitCount >= kMaxEvacExits) return;
+    struct EvacExit *ex = (struct EvacExit *)_exitBuffer.contents;
+    ex[_evacExitCount++] = { x, y, radius, 0.f };
+    SimParams *p = (SimParams *)_params.contents;
+    p->exitCount = (int)_evacExitCount;
+    _flowFieldDirty = YES;
+}
+
+- (void)clearEvacExits {
+    _evacExitCount = 0;
+    ((SimParams *)_params.contents)->exitCount = 0;
+    memset(_exitBuffer.contents, 0, kMaxEvacExits * sizeof(struct EvacExit));
+    _flowFieldDirty = YES;
+}
+
+- (void)spawnEvacAgents:(uint32_t)count {
+    if (count == 0 || count > _agentCount) count = _agentCount;
+
+    // Build blocked map (same logic as recomputeFlowField)
+    const float cellSz = Simulation::kNeighborRadius;
+    const float blockR = cellSz * 0.5f;
+    bool blocked[kNumCells] = {};
+    if (_obstacleCount > 0) {
+        const struct Obstacle *obs = (const struct Obstacle *)_obstacleBuffer.contents;
+        for (int c = 0; c < kNumCells; c++) {
+            float cx = ((c % kGridWidth) + 0.5f) * cellSz;
+            float cy = ((c / kGridWidth) + 0.5f) * cellSz;
+            for (uint32_t oi = 0; oi < _obstacleCount && !blocked[c]; oi++) {
+                float ax = obs[oi].x0, ay = obs[oi].y0;
+                float bx = obs[oi].x1, by = obs[oi].y1;
+                float abx = bx-ax, aby = by-ay;
+                float len2 = abx*abx + aby*aby;
+                float t = len2 > 0.f
+                    ? std::clamp(((cx-ax)*abx + (cy-ay)*aby) / len2, 0.f, 1.f)
+                    : 0.f;
+                float dx = cx-(ax+t*abx), dy = cy-(ay+t*aby);
+                blocked[c] = (dx*dx + dy*dy) < blockR*blockR;
+            }
+        }
+    }
+    // Collect spawn-eligible cells
+    std::vector<int> freeCells;
+    freeCells.reserve(kNumCells);
+    for (int c = 0; c < kNumCells; c++)
+        if (!blocked[c]) freeCells.push_back(c);
+
+    if (freeCells.empty()) return;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> jitter(0.f, cellSz);
+    std::uniform_int_distribution<int>    pickCell(0, (int)freeCells.size() - 1);
+    std::uniform_real_distribution<float> spd(80.f, 120.f);
+
+    float *pX  = (float *)_posX.contents,  *pY  = (float *)_posY.contents;
+    float *vX  = (float *)_velX.contents,  *vY  = (float *)_velY.contents;
+    float *ms  = (float *)_maxSpeed.contents;
+    float *fX  = (float *)_forceX.contents, *fY = (float *)_forceY.contents;
+    float *act = (float *)_activeBuffer.contents;
+    float *ext = (float *)_exitTimeBuffer.contents;
+
+    for (uint32_t i = 0; i < count; i++) {
+        int   c  = freeCells[pickCell(rng)];
+        float cx = (c % kGridWidth) * cellSz + jitter(rng);
+        float cy = (c / kGridWidth) * cellSz + jitter(rng);
+        pX[i] = std::clamp(cx, 0.f, Simulation::kWorldWidth);
+        pY[i] = std::clamp(cy, 0.f, Simulation::kWorldHeight);
+        vX[i] = 0.f; vY[i] = 0.f;
+        ms[i] = spd(rng);
+        fX[i] = 0.f; fY[i] = 0.f;
+        act[i] = 1.f;
+        ext[i] = 0.f;
+    }
+    // Agents beyond `count` are inactive (invisible)
+    for (uint32_t i = count; i < _agentCount; i++) {
+        act[i] = 0.f;
+        pX[i] = -9999.f; pY[i] = -9999.f;
+    }
+
+    *((uint32_t *)_liveCountBuffer.contents) = count;
+    _evacSpawnCount  = count;
+    _evacSpawnFrame  = _frameIndex;
+    _evacuationComplete = NO;
+
+    SimParams *p      = (SimParams *)_params.contents;
+    p->agentCount     = (int)_agentCount;  // GPU always dispatches full N
+    _evacuationMode   = YES;
+    p->evacuationMode = 1;
+    _useFlowField     = YES;
+    p->useFlowField   = 1;
+    _useORCA          = YES;
+    p->useORCA        = 1;
+    if (_evacExitCount > 0) [self recomputeFlowField];
+}
+
+- (void)resetEvacuation {
+    _evacuationMode = NO;
+    ((SimParams *)_params.contents)->evacuationMode = 0;
+    _evacuationComplete = NO;
+    float *act = (float *)_activeBuffer.contents;
+    for (uint32_t i = 0; i < _agentCount; i++) act[i] = 1.f;
+    *((uint32_t *)_liveCountBuffer.contents) = _agentCount;
+}
+
+- (EvacMetrics)computeEvacMetrics {
+    EvacMetrics m = {};
+    m.agentsSpawned = _evacSpawnCount;
+    float *ext = (float *)_exitTimeBuffer.contents;
+    float *act = (float *)_activeBuffer.contents;
+    double sumTime = 0.0;
+    uint32_t exited = 0;
+    float dt = ((SimParams *)_params.contents)->dt;
+    for (uint32_t i = 0; i < _evacSpawnCount; i++) {
+        if (act[i] < 0.5f && ext[i] > 0.f) {
+            double t = (ext[i] - (float)_evacSpawnFrame) * (double)dt;
+            sumTime += t;
+            exited++;
+            if (t > m.totalTimeSeconds) m.totalTimeSeconds = t;
+        }
+    }
+    m.agentsExited    = exited;
+    m.avgTimeSeconds  = exited > 0 ? sumTime / exited : 0.0;
+    return m;
 }
 
 // ── Per-frame encode ──────────────────────────────────────────────────────────
@@ -436,7 +627,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
-        // Pass 5 — gather SoA into sorted order
+        // Pass 5 — gather SoA into sorted order (includes active flag)
         {
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:_reorderPipeline];
@@ -452,6 +643,8 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc setBuffer:_sVelY            offset:0 atIndex:9];
             [enc setBuffer:_sMaxSpeed        offset:0 atIndex:10];
             [enc setBuffer:_params           offset:0 atIndex:11];
+            [enc setBuffer:_activeBuffer     offset:0 atIndex:12];
+            [enc setBuffer:_sActive          offset:0 atIndex:13];
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
@@ -481,6 +674,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
             [enc setBuffer:_params           offset:0 atIndex:12];
             [enc setBuffer:_obstacleBuffer   offset:0 atIndex:13];
             [enc setBuffer:_flowFieldBuffer  offset:0 atIndex:14];
+            [enc setBuffer:_sActive          offset:0 atIndex:15];
             [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
             [enc endEncoding];
         }
@@ -505,20 +699,48 @@ static const uint32_t kInitialObstacleCapacity = 64;
         }
     }
 
-    // Final pass — integration (same for both paths)
+    // Pass 7 — integration (all paths)
     {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:_integratePipeline];
-        [enc setBuffer:_posX     offset:0 atIndex:0];
-        [enc setBuffer:_posY     offset:0 atIndex:1];
-        [enc setBuffer:_velX     offset:0 atIndex:2];
-        [enc setBuffer:_velY     offset:0 atIndex:3];
-        [enc setBuffer:_forceX   offset:0 atIndex:4];
-        [enc setBuffer:_forceY   offset:0 atIndex:5];
-        [enc setBuffer:_maxSpeed offset:0 atIndex:6];
-        [enc setBuffer:_params   offset:0 atIndex:7];
+        [enc setBuffer:_posX         offset:0 atIndex:0];
+        [enc setBuffer:_posY         offset:0 atIndex:1];
+        [enc setBuffer:_velX         offset:0 atIndex:2];
+        [enc setBuffer:_velY         offset:0 atIndex:3];
+        [enc setBuffer:_forceX       offset:0 atIndex:4];
+        [enc setBuffer:_forceY       offset:0 atIndex:5];
+        [enc setBuffer:_maxSpeed     offset:0 atIndex:6];
+        [enc setBuffer:_params       offset:0 atIndex:7];
+        [enc setBuffer:_activeBuffer offset:0 atIndex:8];
         [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
         [enc endEncoding];
+    }
+
+    // Pass 8 — exit detection (evacuation mode only)
+    if (_evacuationMode && !_evacuationComplete && _checkExitPipeline && _evacExitCount > 0) {
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:_checkExitPipeline];
+        [enc setBuffer:_posX            offset:0 atIndex:0];
+        [enc setBuffer:_posY            offset:0 atIndex:1];
+        [enc setBuffer:_activeBuffer    offset:0 atIndex:2];
+        [enc setBuffer:_exitTimeBuffer  offset:0 atIndex:3];
+        [enc setBuffer:_liveCountBuffer offset:0 atIndex:4];
+        [enc setBuffer:_exitBuffer      offset:0 atIndex:5];
+        [enc setBuffer:_params          offset:0 atIndex:6];
+        [enc dispatchThreads:agentGrid threadsPerThreadgroup:tg64];
+        [enc endEncoding];
+
+        // Check completion on CPU after GPU finishes (read from previous frame — 1 frame lag)
+        if (!_evacuationComplete) {
+            uint32_t live = *((uint32_t *)_liveCountBuffer.contents);
+            if (live == 0 && _evacSpawnCount > 0) {
+                _evacuationComplete = YES;
+                if (self.evacuationCompleteCallback) {
+                    EvacMetrics m = [self computeEvacMetrics];
+                    self.evacuationCompleteCallback(m);
+                }
+            }
+        }
     }
 }
 

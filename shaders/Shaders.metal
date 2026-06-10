@@ -37,6 +37,7 @@ struct VertexOut {
 //   4 — float *velX   (per-instance vel X, for speed colouring)
 //   5 — float *velY   (per-instance vel Y)
 //   6 — float *maxSpd (per-instance max speed)
+//   7 — float *active (per-instance; 0 = exited, move off-screen)
 vertex VertexOut vs_agent(
     uint               vid    [[vertex_id]],
     uint               iid    [[instance_id]],
@@ -46,7 +47,8 @@ vertex VertexOut vs_agent(
     constant float2   &vp     [[buffer(3)]],
     device const float *velX   [[buffer(4)]],
     device const float *velY   [[buffer(5)]],
-    device const float *maxSpd [[buffer(6)]]
+    device const float *maxSpd [[buffer(6)]],
+    device const float *active [[buffer(7)]]
 ) {
     float2 offsets[4] = {
         float2(-1.f, -1.f),
@@ -54,6 +56,15 @@ vertex VertexOut vs_agent(
         float2( 1.f, -1.f),
         float2( 1.f,  1.f)
     };
+
+    // Move inactive (exited) agents outside the clip volume — no fragment work
+    if (active[iid] < 0.5f) {
+        VertexOut out;
+        out.position = float4(3.f, 3.f, 0.f, 1.f);
+        out.uv       = float2(0.f);
+        out.speed    = 0.f;
+        return out;
+    }
 
     float2 offset   = offsets[vid];
     float2 worldPos = float2(posX[iid] + offset.x * rad[iid],
@@ -133,6 +144,44 @@ vertex ObstacleVert vs_goal(
 
 fragment float4 fs_goal(ObstacleVert in [[stage_in]]) {
     return float4(1.f, 1.f, 1.f, 1.f);
+}
+
+// ── Evacuation: exit zone rendering (green ring, one quad per exit) ───────────
+
+struct ExitVert {
+    float4 position [[position]];
+    float2 uv;
+};
+
+// Buffer layout:
+//   0 — EvacExit *exits  (x, y, radius, _pad per exit)
+//   1 — float2 vp
+vertex ExitVert vs_exit(
+    uint                    vid   [[vertex_id]],
+    uint                    iid   [[instance_id]],
+    device const EvacExit  *exits [[buffer(0)]],
+    constant float2        &vp    [[buffer(1)]]
+) {
+    float2 offsets[4] = {
+        float2(-1.f, -1.f), float2(-1.f,  1.f),
+        float2( 1.f, -1.f), float2( 1.f,  1.f)
+    };
+    float2 off = offsets[vid];
+    float  r   = exits[iid].radius;
+    float2 world = float2(exits[iid].x + off.x * r, exits[iid].y + off.y * r);
+    float2 ndc   = world / vp * 2.f - 1.f;
+    ndc.y        = -ndc.y;
+    ExitVert out;
+    out.position = float4(ndc, 0.f, 1.f);
+    out.uv       = off;
+    return out;
+}
+
+fragment float4 fs_exit(ExitVert in [[stage_in]]) {
+    float d = length(in.uv);
+    if (d > 1.f) discard_fragment();
+    float alpha = d > 0.72f ? 0.85f : 0.20f;   // bright outer ring, dim fill
+    return float4(0.05f, 0.95f, 0.25f, alpha);
 }
 
 // ── Phase 2: GPU compute kernels ─────────────────────────────────────────────
@@ -237,7 +286,7 @@ kernel void k_steer(
 //
 // Buffer layout:
 //   0 posX (rw)  1 posY (rw)  2 velX (rw)  3 velY (rw)
-//   4 forceX (r)  5 forceY (r)  6 maxSpeed (r)  7 SimParams
+//   4 forceX (r)  5 forceY (r)  6 maxSpeed (r)  7 SimParams  8 active (r)
 kernel void k_integrate(
     device float        *posX     [[buffer(0)]],
     device float        *posY     [[buffer(1)]],
@@ -247,9 +296,11 @@ kernel void k_integrate(
     device const float  *forceY   [[buffer(5)]],
     device const float  *maxSpeed [[buffer(6)]],
     constant SimParams  &p        [[buffer(7)]],
+    device const float  *active   [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if ((int)gid >= p.agentCount) return;
+    if (p.evacuationMode && active[gid] < 0.5f) return;  // skip exited agents
 
     float vx = velX[gid] + forceX[gid] * p.dt;
     float vy = velY[gid] + forceY[gid] * p.dt;
@@ -265,11 +316,18 @@ kernel void k_integrate(
     velX[gid] = vx;
     velY[gid] = vy;
 
-    // Integrate position with world wrapping
     float nx = posX[gid] + vx * p.dt;
     float ny = posY[gid] + vy * p.dt;
-    posX[gid] = nx - p.worldWidth  * floor(nx / p.worldWidth);
-    posY[gid] = ny - p.worldHeight * floor(ny / p.worldHeight);
+
+    // Evacuation: clamp to world bounds (arena has walls; agents must not wrap)
+    // Normal mode: wrap so agents cycle continuously
+    if (p.evacuationMode) {
+        posX[gid] = clamp(nx, 0.f, p.worldWidth);
+        posY[gid] = clamp(ny, 0.f, p.worldHeight);
+    } else {
+        posX[gid] = nx - p.worldWidth  * floor(nx / p.worldWidth);
+        posY[gid] = ny - p.worldHeight * floor(ny / p.worldHeight);
+    }
 }
 
 // ── Phase 3: spatial hash grid build + O(9-cell) neighbour search ─────────────
@@ -353,6 +411,8 @@ kernel void k_reorder(
     device float       *sVelY            [[buffer(9)]],
     device float       *sMaxSpeed        [[buffer(10)]],
     constant SimParams &p                [[buffer(11)]],
+    device const float *active           [[buffer(12)]],
+    device float       *sActive          [[buffer(13)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if ((int)gid >= p.agentCount) return;
@@ -362,6 +422,7 @@ kernel void k_reorder(
     sVelX[gid]     = velX[j];
     sVelY[gid]     = velY[j];
     sMaxSpeed[gid] = maxSpeed[j];
+    sActive[gid]   = active[j];
 }
 
 // Pass 6 — steering with tiled 3×3 grid cell neighbour lookup + obstacle avoidance
@@ -398,15 +459,17 @@ kernel void k_steerGrid(
     constant SimParams    &p               [[buffer(12)]],
     device const Obstacle *obstacles       [[buffer(13)]],
     device const float2   *flowField       [[buffer(14)]],
+    device const float    *sActive         [[buffer(15)]],
     uint gid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
-    // ── Threadgroup (on-chip) memory — 5 × 64 × 4 B = 1280 B per threadgroup ──
+    // ── Threadgroup (on-chip) memory — 6 × 64 × 4 B = 1536 B per threadgroup ──
     threadgroup float tgPosX   [64];
     threadgroup float tgPosY   [64];
     threadgroup float tgVelX   [64];
     threadgroup float tgVelY   [64];
     threadgroup float tgMaxSpd [64];
+    threadgroup float tgActive [64];
     threadgroup int   tgRefX   [1];   // thread-0's cell X, broadcast to all
     threadgroup int   tgRefY   [1];
 
@@ -415,6 +478,8 @@ kernel void k_steerGrid(
     float py     = active ? sPosY   [gid] : 0.f;
     float ms     = active ? sMaxSpeed[gid]: 1.f;
     uint  oi     = active ? sortedAgentIndex[gid] : 0u;
+    // alive = valid gid AND not yet exited (evacuation active flag)
+    bool  alive  = active && (sActive[gid] > 0.5f);
 
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
@@ -427,7 +492,7 @@ kernel void k_steerGrid(
 
     float fx = 0.f, fy = 0.f;
 
-    if (active) {
+    if (alive) {
         if (p.useFlowField) {
             float2 dir = flowField[agCellX + agCellY * p.gridWidth];
             fx += p.weightSeek * dir.x * ms;
@@ -453,6 +518,7 @@ kernel void k_steerGrid(
     float aliVX = 0.f, aliVY = 0.f;
     float cohX = 0.f, cohY = 0.f;
     int   count = 0;
+    int   densCount = 0;
 
     // ── Tiled 3×3 neighbourhood scan ──────────────────────────────────────────
     for (int dy = -1; dy <= 1; dy++) {
@@ -466,8 +532,6 @@ kernel void k_steerGrid(
             uint start = cellStart[cid];     // uniform
             uint end   = start + cellCount[cid]; // uniform
 
-            // Each outer iteration processes one 64-agent tile: all 64 threads
-            // cooperatively load the tile then individually scan it.
             for (uint tileBase = start; tileBase < end; tileBase += 64) {
                 // ── Cooperative load ────────────────────────────────────────
                 uint k = tileBase + lid;
@@ -477,23 +541,28 @@ kernel void k_steerGrid(
                     tgVelX  [lid] = sVelX   [k];
                     tgVelY  [lid] = sVelY   [k];
                     tgMaxSpd[lid] = sMaxSpeed[k];
+                    tgActive[lid] = sActive [k];
                 } else {
-                    tgPosX[lid] = 1e30f;  // sentinel: distance check will reject
-                    tgPosY[lid] = 1e30f;
-                    tgVelX[lid] = 0.f; tgVelY[lid] = 0.f; tgMaxSpd[lid] = 1.f;
+                    tgPosX  [lid] = 1e30f;
+                    tgPosY  [lid] = 1e30f;
+                    tgVelX  [lid] = 0.f; tgVelY[lid] = 0.f; tgMaxSpd[lid] = 1.f;
+                    tgActive[lid] = 0.f;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                // ── Scan loaded tile (active threads only) ───────────────────
-                if (active) {
+                // ── Scan loaded tile (alive threads only) ────────────────────
+                if (alive) {
                     uint tileSize = min(tileBase + 64u, end) - tileBase;
                     for (uint ti = 0; ti < tileSize; ti++) {
-                        if (tileBase + ti == gid) continue;  // self-skip
+                        if (tileBase + ti == gid) continue;    // self-skip
+                        if (tgActive[ti] < 0.5f) continue;    // skip exited agents
 
                         float ndx = tgPosX[ti] - px;
                         float ndy = tgPosY[ti] - py;
                         float nd2 = ndx * ndx + ndy * ndy;
                         if (nd2 > p.neighborRadius2) continue;
+
+                        if (nd2 < p.densityRadius2) densCount++;
 
                         float nd = sqrt(nd2);
 
@@ -515,7 +584,7 @@ kernel void k_steerGrid(
         }
     }
 
-    if (!active) return;
+    if (!active || !alive) return;
 
     fx += p.weightSep * sepX;
     fy += p.weightSep * sepY;
@@ -551,8 +620,13 @@ kernel void k_steerGrid(
         }
     }
 
-    forceX[oi] = fx;
-    forceY[oi] = fy;
+    // Density-dependent speed: scale all forces down in dense crowds (evacuation only)
+    float speedFactor = (p.evacuationMode && p.densityJamCount > 0.f)
+        ? clamp(1.f - (float)densCount / p.densityJamCount, 0.1f, 1.f)
+        : 1.f;
+
+    forceX[oi] = fx * speedFactor;
+    forceY[oi] = fy * speedFactor;
 }
 
 // Untiled reference kernel — original k_steerGrid without threadgroup memory.
@@ -777,22 +851,25 @@ kernel void k_orca(
     constant SimParams    &p               [[buffer(12)]],
     device const Obstacle *obstacles       [[buffer(13)]],
     device const float2   *flowField       [[buffer(14)]],
+    device const float    *sActive         [[buffer(15)]],
     uint gid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     // ── Threadgroup memory ───────────────────────────────────────────────────
-    threadgroup float tgPosX [64];
-    threadgroup float tgPosY [64];
-    threadgroup float tgVelX [64];
-    threadgroup float tgVelY [64];
-    threadgroup int   tgRefX [1];
-    threadgroup int   tgRefY [1];
+    threadgroup float tgPosX   [64];
+    threadgroup float tgPosY   [64];
+    threadgroup float tgVelX   [64];
+    threadgroup float tgVelY   [64];
+    threadgroup float tgActive [64];
+    threadgroup int   tgRefX   [1];
+    threadgroup int   tgRefY   [1];
 
     bool  active = ((int)gid < p.agentCount);
     float px     = active ? sPosX   [gid] : 0.f;
     float py     = active ? sPosY   [gid] : 0.f;
     float ms     = active ? sMaxSpeed[gid]: 1.f;
     uint  oi     = active ? sortedAgentIndex[gid] : 0u;
+    bool  alive  = active && (sActive[gid] > 0.5f);
 
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
@@ -804,7 +881,7 @@ kernel void k_orca(
 
     // ── Preferred velocity ───────────────────────────────────────────────────
     float2 prefVel = float2(0.f);
-    if (active) {
+    if (alive) {
         if (p.useFlowField) {
             float2 dir = flowField[agCellX + agCellY * p.gridWidth];
             prefVel = dir * ms;
@@ -846,9 +923,10 @@ kernel void k_orca(
     // ── Build ORCA half-planes from nearby agents (tiled) ────────────────────
     float2 lp_arr[kMaxORCA];
     float2 ld_arr[kMaxORCA];
-    int numORCA = 0;
+    int numORCA   = 0;
+    int densCount = 0;
 
-    float2 myVel = active ? float2(sVelX[gid], sVelY[gid]) : float2(0.f);
+    float2 myVel = alive ? float2(sVelX[gid], sVelY[gid]) : float2(0.f);
     float  tau   = p.orcaTimeHorizon;
     float  combR = 10.f;
     float  combR2 = combR * combR;
@@ -868,27 +946,32 @@ kernel void k_orca(
                 // ── Cooperative load ────────────────────────────────────────
                 uint k = tileBase + lid;
                 if (k < (uint)p.agentCount) {
-                    tgPosX[lid] = sPosX[k];
-                    tgPosY[lid] = sPosY[k];
-                    tgVelX[lid] = sVelX[k];
-                    tgVelY[lid] = sVelY[k];
+                    tgPosX  [lid] = sPosX  [k];
+                    tgPosY  [lid] = sPosY  [k];
+                    tgVelX  [lid] = sVelX  [k];
+                    tgVelY  [lid] = sVelY  [k];
+                    tgActive[lid] = sActive[k];
                 } else {
-                    tgPosX[lid] = 1e30f;
-                    tgPosY[lid] = 1e30f;
-                    tgVelX[lid] = 0.f;
-                    tgVelY[lid] = 0.f;
+                    tgPosX  [lid] = 1e30f;
+                    tgPosY  [lid] = 1e30f;
+                    tgVelX  [lid] = 0.f;
+                    tgVelY  [lid] = 0.f;
+                    tgActive[lid] = 0.f;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 // ── Scan loaded tile ─────────────────────────────────────────
-                if (active) {
+                if (alive) {
                     uint tileSize = min(tileBase + 64u, end) - tileBase;
                     for (uint ti = 0; ti < tileSize; ti++) {
                         if (tileBase + ti == gid) continue;
+                        if (tgActive[ti] < 0.5f) continue;     // skip exited agents
 
                         float2 relPos = float2(tgPosX[ti] - px, tgPosY[ti] - py);
                         float  dist2  = dot(relPos, relPos);
                         if (dist2 > p.neighborRadius2) continue;
+
+                        if (dist2 < p.densityRadius2) densCount++;
 
                         if (numORCA >= kMaxORCA) continue; // cap reached; skip write
 
@@ -937,10 +1020,51 @@ kernel void k_orca(
         }
     }
 
-    if (!active) return;
+    if (!active || !alive) return;
+
+    // Density-dependent speed: scale preferred velocity in dense crowds (evacuation only)
+    if (p.evacuationMode && p.densityJamCount > 0.f) {
+        float sf = clamp(1.f - (float)densCount / p.densityJamCount, 0.1f, 1.f);
+        prefVel *= sf;
+    }
 
     float2 newVel = lp2(lp_arr, ld_arr, numORCA, ms, prefVel);
 
     forceX[oi] = (newVel.x - myVel.x) / p.dt;
     forceY[oi] = (newVel.y - myVel.y) / p.dt;
+}
+
+// ── Evacuation: exit detection ────────────────────────────────────────────────
+//
+// Runs after k_integrate each frame (evacuation mode only).
+// Agents within any exit zone radius are marked inactive and atomically removed
+// from liveCount.  Once active[i] = 0 the agent is permanently inert.
+//
+// Buffer layout:
+//   0 posX (r)   1 posY (r)   2 active (rw)   3 exitTime (w)
+//   4 liveCount (atomic rw)   5 exits (r)      6 SimParams
+kernel void k_checkExit(
+    device const float     *posX      [[buffer(0)]],
+    device const float     *posY      [[buffer(1)]],
+    device float           *active    [[buffer(2)]],
+    device float           *exitTime  [[buffer(3)]],
+    device atomic_uint     *liveCount [[buffer(4)]],
+    device const EvacExit  *exits     [[buffer(5)]],
+    constant SimParams     &p         [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= p.agentCount) return;
+    if (active[gid] < 0.5f) return;   // already exited
+
+    float px = posX[gid], py = posY[gid];
+    for (int e = 0; e < p.exitCount; e++) {
+        float dx = px - exits[e].x;
+        float dy = py - exits[e].y;
+        if (dx * dx + dy * dy < exits[e].radius * exits[e].radius) {
+            active[gid]   = 0.f;
+            exitTime[gid] = (float)p.frameIndex;
+            atomic_fetch_sub_explicit(liveCount, 1u, memory_order_relaxed);
+            return;
+        }
+    }
 }
