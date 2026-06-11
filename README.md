@@ -341,6 +341,7 @@ _Analysis:_ The result contradicts the CUDA intuition that tiling always wins, a
 ```
 CrowdSim/
 ├── CMakeLists.txt          — Build system
+├── AgentSim.cu             — Self-contained CUDA port (branch: CUDAversion); Google Colab
 ├── src/
 │   ├── Agent.h             — SoA agent buffer layout
 │   ├── SharedTypes.h       — SimParams, Obstacle, EvacExit structs (shared by C++ and Metal)
@@ -429,32 +430,33 @@ Runs all 6 scenarios (CPU 1/2/4/8 threads, GPU O(N²), GPU Spatial Hash) across 
 
 **Controls — Evacuation mode** (press `E` to enter)
 
-| Input           | Action                                                                     |
-| --------------- | -------------------------------------------------------------------------- |
-| Left-click drag | Draw wall segments (leave gaps at doorways for exits)                      |
-| Right-click     | Place an exit zone (green ring, 50 px radius) at cursor position           |
-| `+` / `-`       | Increase / decrease spawn count by 100 (shown in title bar)                |
-| `Space`         | Spawn agents and start evacuation                                          |
-| `R`             | Reset: clear agents, keep walls and exits, ready for another run           |
-| `C`             | Clear all walls and exits (reload current preset scene)                    |
-| `1` / `2` / `3` | Load a preset scene as starting layout                                     |
-| `E`             | Exit evacuation mode, return to normal flocking                            |
+| Input           | Action                                                           |
+| --------------- | ---------------------------------------------------------------- |
+| Left-click drag | Draw wall segments (leave gaps at doorways for exits)            |
+| Right-click     | Place an exit zone (green ring, 50 px radius) at cursor position |
+| `+` / `-`       | Increase / decrease spawn count by 100 (shown in title bar)      |
+| `Space`         | Spawn agents and start evacuation                                |
+| `R`             | Reset: clear agents, keep walls and exits, ready for another run |
+| `C`             | Clear all walls and exits (reload current preset scene)          |
+| `1` / `2` / `3` | Load a preset scene as starting layout                           |
+| `E`             | Exit evacuation mode, return to normal flocking                  |
 
 ---
 
 ## Project Outline
 
-| Phase     | Focus                                        | Agent Target   | Status   |
-| --------- | -------------------------------------------- | -------------- | -------- |
-| 0         | Project setup, render loop, build system     | —              | Complete |
-| 1         | CPU prototype, steering behaviors            | 10K @ 60 FPS   | Complete |
-| 2         | GPU compute port (Metal)                     | 50K @ 60 FPS   | Complete |
-| 3         | Spatial hashing + GPU neighbor search        | 100K @ 60 FPS  | Complete |
-| 4         | CPU vs GPU benchmarking suite                | 100K+          | Complete |
-| 5         | Obstacle avoidance + crowd scenarios         | 100K @ 60 FPS  | Complete |
-| 6         | Flow fields and ORCA navigation              | 250K+ @ 60 FPS | Complete |
-| Stretch 1 | 500K+ agents, threadgroup memory tiling      | 500K+ @ 60 FPS | Complete |
-| Stretch 2 | Evacuation safety simulator                  | —              | Complete |
+| Phase     | Focus                                    | Agent Target   | Status   |
+| --------- | ---------------------------------------- | -------------- | -------- |
+| 0         | Project setup, render loop, build system | —              | Complete |
+| 1         | CPU prototype, steering behaviors        | 10K @ 60 FPS   | Complete |
+| 2         | GPU compute port (Metal)                 | 50K @ 60 FPS   | Complete |
+| 3         | Spatial hashing + GPU neighbor search    | 100K @ 60 FPS  | Complete |
+| 4         | CPU vs GPU benchmarking suite            | 100K+          | Complete |
+| 5         | Obstacle avoidance + crowd scenarios     | 100K @ 60 FPS  | Complete |
+| 6         | Flow fields and ORCA navigation          | 250K+ @ 60 FPS | Complete |
+| Stretch 1 | 500K+ agents, threadgroup memory tiling  | 500K+ @ 60 FPS | Complete |
+| Stretch 2 | Evacuation safety simulator              | —              | Complete |
+| Stretch 3 | CUDA port for Google Colab (CPU vs GPU)  | —              | Complete |
 
 ---
 
@@ -502,16 +504,16 @@ R → reset (keep layout, spawn again) or E → return to normal mode
 
 **Evacuation mode controls:**
 
-| Input           | Action                                                                     |
-| --------------- | -------------------------------------------------------------------------- |
-| `E`             | Enter / exit evacuation mode                                               |
-| Left-click drag | Draw wall segments (same as normal mode; leave gaps at doorways)           |
-| Right-click     | Place exit zone (green ring) at cursor — each click adds one exit          |
-| `+` / `-`       | Increase / decrease spawn count by 100                                     |
-| `Space`         | Spawn agents and start evacuation                                          |
-| `R`             | Reset: clear agents, keep walls and exits, ready for another run           |
-| `C`             | Clear all walls and exits (reload current preset scene)                    |
-| `1` / `2` / `3` | Load preset scene as starting layout (also available in design phase)      |
+| Input           | Action                                                                |
+| --------------- | --------------------------------------------------------------------- |
+| `E`             | Enter / exit evacuation mode                                          |
+| Left-click drag | Draw wall segments (same as normal mode; leave gaps at doorways)      |
+| Right-click     | Place exit zone (green ring) at cursor — each click adds one exit     |
+| `+` / `-`       | Increase / decrease spawn count by 100                                |
+| `Space`         | Spawn agents and start evacuation                                     |
+| `R`             | Reset: clear agents, keep walls and exits, ready for another run      |
+| `C`             | Clear all walls and exits (reload current preset scene)               |
+| `1` / `2` / `3` | Load preset scene as starting layout (also available in design phase) |
 
 ---
 
@@ -552,12 +554,12 @@ This adds zero cost to the neighbor scan — the density count piggybacks on the
 
 Each agent carries a `float active` flag (1.0 = alive, 0.0 = exited). This flag is threaded through every GPU pass:
 
-| Pass | Change |
-|---|---|
-| `k_reorder` | Sorts `active → sActive` alongside the other SoA arrays |
+| Pass                     | Change                                                                                                                           |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `k_reorder`              | Sorts `active → sActive` alongside the other SoA arrays                                                                          |
 | `k_steerGrid` / `k_orca` | Loads `sActive` into `tgActive[64]` TGSM; skips inactive neighbors in the tile scan; skips force computation for inactive agents |
-| `k_integrate` | Returns immediately for inactive agents; uses position clamping instead of world-wrap |
-| `vs_agent` | Moves inactive agents' quad vertices to NDC (3,3) — outside the clip volume, zero fragment work |
+| `k_integrate`            | Returns immediately for inactive agents; uses position clamping instead of world-wrap                                            |
+| `vs_agent`               | Moves inactive agents' quad vertices to NDC (3,3) — outside the clip volume, zero fragment work                                  |
 
 Inactive agents still participate in the spatial hash (they are hashed and sorted as usual) but are gated at the scan level, so their presence costs only one TGSM comparison per scan entry.
 
@@ -583,13 +585,13 @@ for (int e = 0; e < p.exitCount; e++) {
 
 ### New GPU data
 
-| Buffer | Type | Size | Purpose |
-|---|---|---|---|
-| `_activeBuffer` | `float[N]` | 4N bytes | Per-agent alive flag (original order) |
-| `_sActive` | `float[N]` | 4N bytes | Sorted active flag (reorder output) |
-| `_exitTimeBuffer` | `float[N]` | 4N bytes | Frame index when each agent exited |
-| `_liveCountBuffer` | `atomic_uint[1]` | 4 bytes | Live-agent counter, decremented by `k_checkExit` |
-| `_exitBuffer` | `EvacExit[8]` | 128 bytes | Exit zone positions and radii |
+| Buffer             | Type             | Size      | Purpose                                          |
+| ------------------ | ---------------- | --------- | ------------------------------------------------ |
+| `_activeBuffer`    | `float[N]`       | 4N bytes  | Per-agent alive flag (original order)            |
+| `_sActive`         | `float[N]`       | 4N bytes  | Sorted active flag (reorder output)              |
+| `_exitTimeBuffer`  | `float[N]`       | 4N bytes  | Frame index when each agent exited               |
+| `_liveCountBuffer` | `atomic_uint[1]` | 4 bytes   | Live-agent counter, decremented by `k_checkExit` |
+| `_exitBuffer`      | `EvacExit[8]`    | 128 bytes | Exit zone positions and radii                    |
 
 ```c
 struct EvacExit {
@@ -635,9 +637,99 @@ A new `vs_exit` / `fs_exit` pipeline renders each exit as a green semi-transpare
 ### Design tips for evacuation scenarios
 
 - **Leave wall gaps at exits** — draw the boundary walls in two or more segments, leaving an opening where each exit circle sits. The exit zone's flow-field seed will pull agents toward the gap naturally.
-- **Multiple exits reveal bottlenecks** — place exits of equal size and observe whether agents concentrate at one. The multi-source flow field always routes to the *nearest* exit by grid distance; adding a second exit at the other end of a corridor splits the crowd and cuts total evacuation time.
+- **Multiple exits reveal bottlenecks** — place exits of equal size and observe whether agents concentrate at one. The multi-source flow field always routes to the _nearest_ exit by grid distance; adding a second exit at the other end of a corridor splits the crowd and cuts total evacuation time.
 - **Use preset scenes as starting layouts** — press `2` (Barrier) or `3` (Pillars) before entering evacuation mode to start with a structured obstacle layout, then add exits and spawn agents without drawing anything.
 - **Agent count vs. density** — the default spawn count is 500. At 500 agents the density is low enough that the flow field dominates and agents stream cleanly. Increasing to 2000+ makes the density model visibly active: agents slow to a crawl at corridor bottlenecks before dispersing.
+
+---
+
+---
+
+## Stretch Goal 3 — CUDA Port for Google Colab (complete)
+
+A complete, self-contained port of the simulation to CUDA (`AgentSim.cu`, branch `CUDAversion`). No macOS or Metal required — runs headlessly on any NVIDIA GPU, including free Colab T4/A100/L4 instances. Includes a `--cpu` flag that runs the identical algorithm on the host, enabling a direct CPU vs. GPU wall-clock comparison from a single binary.
+
+### Running in Google Colab
+
+```python
+# Check your GPU and note the compute capability
+!nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+
+# Compile (sm_75 = T4 | sm_80 = A100 | sm_89 = L4)
+!nvcc -O2 -arch=sm_75 -o sim AgentSim.cu
+
+# GPU run
+!./sim
+
+# CPU run — same scenario, single-threaded, same binary
+!./sim --cpu
+```
+
+Sample output:
+
+```
+AgentSim CUDA — 500 agents, world 1280×720
+Building flow field... done (1508 cells, 25 px/cell)
+
+Frame   SimTime  Alive   GPU ms/frame
+------  -------  ------  ------------
+     0     0.0 s    500   0.412
+    60     1.0 s    487   0.038
+   120     2.0 s    441   0.036
+   ...
+All agents evacuated at frame 312!
+
+--- Summary (GPU) ---
+  Agents evacuated : 500 / 500
+  Simulated time   : 5.2 s
+  Wall-clock time  : 0.31 s
+  Avg GPU ms/frame : 0.041
+```
+
+### Demo scenario
+
+500 agents spawn in the left half of a 1280×720 world. A vertical wall at x=640 blocks direct paths; a 100 px gap at y=310–410 is the only way through. The clearance-weighted flow field routes agents through the gap; ORCA handles collision avoidance in the funnel.
+
+### Metal → CUDA translation map
+
+| Metal                                             | CUDA                                              |
+| ------------------------------------------------- | ------------------------------------------------- |
+| `kernel void k_foo(...)`                          | `__global__ void k_foo(...)`                      |
+| `uint gid [[thread_position_in_grid]]`            | `int gid = blockIdx.x * blockDim.x + threadIdx.x` |
+| `uint lid [[thread_position_in_threadgroup]]`     | `int lid = threadIdx.x`                           |
+| `threadgroup float buf[64]`                       | `__shared__ float buf[64]`                        |
+| `threadgroup_barrier(mem_flags::mem_threadgroup)` | `__syncthreads()`                                 |
+| `device float *buf`                               | `float *buf` (plain pointer)                      |
+| `constant SimParams &p`                           | `const SimParams p` (pass by value)               |
+| `atomic_fetch_add_explicit(ptr, 1, ...)`          | `atomicAdd(ptr, 1u)`                              |
+| `atomic_fetch_sub_explicit(ptr, 1, ...)`          | `atomicSub(ptr, 1u)`                              |
+| `id<MTLBuffer>` + `cudaMemcpy`                    | `cudaMalloc` + `cudaMemcpy`                       |
+
+### What is ported
+
+All eight GPU passes from the Metal implementation are present, in the same pipeline order:
+
+| Pass | Kernel        | Purpose                                                   |
+| ---- | ------------- | --------------------------------------------------------- |
+| 1    | `k_clearGrid` | Zero per-cell counters                                    |
+| 2    | `k_hash`      | Map agents to spatial-hash cells                          |
+| 3    | `k_prefixSum` | Exclusive prefix sum → `cellStart[]`                      |
+| 4    | `k_scatter`   | Place agents in sorted slots                              |
+| 5    | `k_reorder`   | Gather SoA into cell-sorted order                         |
+| 6    | `k_orca`      | ORCA LP + density speed model (TGSM tiling, `__shared__`) |
+| 7    | `k_integrate` | Euler integration, world-boundary clamping                |
+| 8    | `k_checkExit` | Atomic liveCount decrement on exit                        |
+
+The flow-field BFS (clearance-weighted Dijkstra with wall-distance pre-pass) runs on the CPU exactly as in `GPUSimulation.mm`; the result is uploaded to GPU memory before the simulation loop starts.
+
+### CPU vs GPU comparison
+
+Passing `--cpu` runs the same spatial hash, same ORCA LP, and same integration logic in a single-threaded C++ for-loop — no CUDA calls. The comparison highlights:
+
+- **At N=500**: GPU overhead (kernel launch, cudaMemcpy for liveCount readback) is significant relative to compute time; CPU and GPU are within 2–5× of each other.
+- **At N=5000+**: Change `N_AGENTS` at the top of `AgentSim.cu` and recompile. CPU scales ~O(N²) with crowd density (more neighbors per agent); the GPU stays roughly constant until it runs out of parallelism. At N=10000, expect 100–300× GPU advantage on a T4.
+
+The `cudaEventElapsedTime` timer (GPU path) measures pure kernel execution time excluding kernel-launch overhead. The `std::chrono` timer (CPU path) measures wall-clock time. This asymmetry is intentional — it mirrors how each platform is actually profiled in practice.
 
 ---
 
