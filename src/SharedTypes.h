@@ -35,6 +35,10 @@ struct SimParams {
     int   gridHeight;
     int   numCells;
     float cellSize;
+    // Flow field grid — double the spatial-hash resolution for finer obstacle navigation
+    int   flowGridWidth;
+    int   flowGridHeight;
+    float flowCellSize;
     // Phase 5 — obstacle avoidance
     int   obstacleCount;
     float obstacleAvoidRadius;

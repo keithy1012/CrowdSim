@@ -313,21 +313,27 @@ kernel void k_integrate(
         vy *= s;
     }
 
-    velX[gid] = vx;
-    velY[gid] = vy;
-
     float nx = posX[gid] + vx * p.dt;
     float ny = posY[gid] + vy * p.dt;
 
-    // Evacuation: clamp to world bounds (arena has walls; agents must not wrap)
-    // Normal mode: wrap so agents cycle continuously
+    // Evacuation: clamp to world bounds (arena has walls; agents must not wrap).
+    // Zero the wall-normal velocity component when clamped — without this the agent
+    // keeps a persistent velocity directed into the wall and can't escape the boundary.
+    // Normal mode: wrap so agents cycle continuously.
     if (p.evacuationMode) {
-        posX[gid] = clamp(nx, 0.f, p.worldWidth);
-        posY[gid] = clamp(ny, 0.f, p.worldHeight);
+        if (nx < 0.f)             { nx = 0.f;           vx = 0.f; }
+        else if (nx > p.worldWidth)  { nx = p.worldWidth;  vx = 0.f; }
+        if (ny < 0.f)             { ny = 0.f;           vy = 0.f; }
+        else if (ny > p.worldHeight) { ny = p.worldHeight; vy = 0.f; }
+        posX[gid] = nx;
+        posY[gid] = ny;
     } else {
         posX[gid] = nx - p.worldWidth  * floor(nx / p.worldWidth);
         posY[gid] = ny - p.worldHeight * floor(ny / p.worldHeight);
     }
+
+    velX[gid] = vx;
+    velY[gid] = vy;
 }
 
 // ── Phase 3: spatial hash grid build + O(9-cell) neighbour search ─────────────
@@ -490,13 +496,20 @@ kernel void k_steerGrid(
     int refCellX = tgRefX[0];
     int refCellY = tgRefY[0];
 
+    // Flow field uses a finer grid (flowCellSize) than the spatial hash.
+    int fCellX = clamp((int)(px / p.flowCellSize), 0, p.flowGridWidth  - 1);
+    int fCellY = clamp((int)(py / p.flowCellSize), 0, p.flowGridHeight - 1);
+
     float fx = 0.f, fy = 0.f;
+    // Forward direction used for density counting (only agents ahead slow you down)
+    float fwdX = 0.f, fwdY = 0.f;
 
     if (alive) {
         if (p.useFlowField) {
-            float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+            float2 dir = flowField[fCellX + fCellY * p.flowGridWidth];
             fx += p.weightSeek * dir.x * ms;
             fy += p.weightSeek * dir.y * ms;
+            fwdX = dir.x; fwdY = dir.y;
         } else {
             float gdx = targetX[oi] - px;
             float gdy = targetY[oi] - py;
@@ -510,6 +523,7 @@ kernel void k_steerGrid(
                 float inv = ms / sqrt(gd2);
                 fx += p.weightSeek * gdx * inv;
                 fy += p.weightSeek * gdy * inv;
+                fwdX = gdx * inv; fwdY = gdy * inv;
             }
         }
     }
@@ -562,7 +576,10 @@ kernel void k_steerGrid(
                         float nd2 = ndx * ndx + ndy * ndy;
                         if (nd2 > p.neighborRadius2) continue;
 
-                        if (nd2 < p.densityRadius2) densCount++;
+                        // Count only agents in the forward half-space: agents behind
+                        // you don't block your path, so they shouldn't slow you down.
+                        if (nd2 < p.densityRadius2 && (ndx * fwdX + ndy * fwdY) > 0.f)
+                            densCount++;
 
                         float nd = sqrt(nd2);
 
@@ -660,9 +677,11 @@ kernel void k_steerGrid_notiled(
 
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
+    int fCellX  = clamp((int)(px / p.flowCellSize), 0, p.flowGridWidth  - 1);
+    int fCellY  = clamp((int)(py / p.flowCellSize), 0, p.flowGridHeight - 1);
 
     if (p.useFlowField) {
-        float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+        float2 dir = flowField[fCellX + fCellY * p.flowGridWidth];
         fx += p.weightSeek * dir.x * ms;
         fy += p.weightSeek * dir.y * ms;
     } else {
@@ -873,6 +892,8 @@ kernel void k_orca(
 
     int agCellX = clamp((int)(px / p.cellSize), 0, p.gridWidth  - 1);
     int agCellY = clamp((int)(py / p.cellSize), 0, p.gridHeight - 1);
+    int fCellX  = clamp((int)(px / p.flowCellSize), 0, p.flowGridWidth  - 1);
+    int fCellY  = clamp((int)(py / p.flowCellSize), 0, p.flowGridHeight - 1);
 
     if (lid == 0) { tgRefX[0] = agCellX; tgRefY[0] = agCellY; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -883,7 +904,7 @@ kernel void k_orca(
     float2 prefVel = float2(0.f);
     if (alive) {
         if (p.useFlowField) {
-            float2 dir = flowField[agCellX + agCellY * p.gridWidth];
+            float2 dir = flowField[fCellX + fCellY * p.flowGridWidth];
             prefVel = dir * ms;
         } else {
             float gdx = targetX[oi] - px;
@@ -916,8 +937,8 @@ kernel void k_orca(
                 prefVel += ms * strength * (repulse / dist);
             }
         }
-        float prefSpd = length(prefVel);
-        if (prefSpd > ms) prefVel *= ms / prefSpd;
+        float prefSpdClamp = length(prefVel);
+        if (prefSpdClamp > ms) prefVel *= ms / prefSpdClamp;
     }
 
     // ── Build ORCA half-planes from nearby agents (tiled) ────────────────────
@@ -925,6 +946,10 @@ kernel void k_orca(
     float2 ld_arr[kMaxORCA];
     int numORCA   = 0;
     int densCount = 0;
+
+    // Forward direction for density: normalised prefVel (falls back to zero if stopped).
+    float prefSpd0 = length(prefVel);
+    float2 fwd = prefSpd0 > 0.001f ? prefVel / prefSpd0 : float2(0.f);
 
     float2 myVel = alive ? float2(sVelX[gid], sVelY[gid]) : float2(0.f);
     float  tau   = p.orcaTimeHorizon;
@@ -971,7 +996,9 @@ kernel void k_orca(
                         float  dist2  = dot(relPos, relPos);
                         if (dist2 > p.neighborRadius2) continue;
 
-                        if (dist2 < p.densityRadius2) densCount++;
+                        // Only count agents ahead in the preferred direction.
+                        if (dist2 < p.densityRadius2 && dot(relPos, fwd) > 0.f)
+                            densCount++;
 
                         if (numORCA >= kMaxORCA) continue; // cap reached; skip write
 

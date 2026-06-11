@@ -6,11 +6,18 @@
 #include <algorithm>
 #include <cmath>
 
-// Grid dimensions derived from world size and neighbor radius.
-// cellSize == kNeighborRadius ensures a 3×3 cell search covers the full interaction circle.
-static const int kGridWidth  = 26;  // ceil(1280 / 50)
-static const int kGridHeight = 15;  // ceil( 720 / 50)
-static const int kNumCells   = kGridWidth * kGridHeight; // 390
+// Spatial hash grid — cell size == kNeighborRadius so a 3×3 search covers the full
+// interaction circle without missing any neighbour.
+static const int kGridWidth  = 26;   // ceil(1280 / 50)
+static const int kGridHeight = 15;   // ceil( 720 / 50)
+static const int kNumCells   = kGridWidth * kGridHeight;  // 390
+
+// Flow-field grid — 2× resolution of the spatial hash so narrow gaps in user-drawn
+// obstacles are represented as passable cells.  The spatial hash cell size is unchanged.
+static const int   kFlowGridWidth  = 52;   // ceil(1280 / 25)
+static const int   kFlowGridHeight = 29;   // ceil( 720 / 25)
+static const int   kFlowNumCells   = kFlowGridWidth * kFlowGridHeight;  // 1508
+static const float kFlowCellSize   = 25.f;
 static const uint32_t kInitialObstacleCapacity = 64;
 
 @implementation GPUSimulation {
@@ -202,9 +209,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _obstacleBuffer   = [self sharedBuf:_obstacleCapacity * sizeof(struct Obstacle)];
     _obstacleCount    = 0;
 
-    // Flow field: float2 per cell, zero-initialised (no flow until goal is set)
-    _flowFieldBuffer = [self sharedBuf:kNumCells * sizeof(float) * 2];
-    memset(_flowFieldBuffer.contents, 0, kNumCells * sizeof(float) * 2);
+    // Flow field: float2 per cell at double resolution (25 px/cell)
+    _flowFieldBuffer = [self sharedBuf:kFlowNumCells * sizeof(float) * 2];
+    memset(_flowFieldBuffer.contents, 0, kFlowNumCells * sizeof(float) * 2);
     _flowGoalSet    = NO;
     _flowFieldDirty = NO;
     _useFlowField   = NO;
@@ -248,6 +255,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
     p->gridHeight        = kGridHeight;
     p->numCells          = kNumCells;
     p->cellSize          = Simulation::kNeighborRadius;
+    p->flowGridWidth     = kFlowGridWidth;
+    p->flowGridHeight    = kFlowGridHeight;
+    p->flowCellSize      = kFlowCellSize;
     p->obstacleCount        = 0;
     p->obstacleAvoidRadius  = 40.f;
     p->obstacleAvoidRadius2 = 40.f * 40.f;
@@ -332,16 +342,21 @@ static const uint32_t kInitialObstacleCapacity = 64;
     // Requires at least one goal: either the traditional single goal or evac exits
     if (!_flowGoalSet && _evacExitCount == 0) return;
 
-    const float cellSz = Simulation::kNeighborRadius;   // 50 px
-    const float blockR = cellSz * 0.5f;
+    // Flow field uses 25 px cells (2× the spatial-hash resolution) so narrow gaps
+    // in user-drawn obstacles are represented as one or more passable cells.
+    const float cellSz = kFlowCellSize;   // 25 px
+    // blockR: a cell is blocked when any obstacle passes within this distance of
+    // its centre.  At 25 px cells, 14 px means any gap wider than ~28 px will
+    // contain at least one passable cell.
+    const float blockR = 14.f;
 
     // ── Build blocked map ──────────────────────────────────────────────────
-    bool blocked[kNumCells] = {};
+    bool blocked[kFlowNumCells] = {};
     if (_obstacleCount > 0) {
         const struct Obstacle *obs = (const struct Obstacle *)_obstacleBuffer.contents;
-        for (int c = 0; c < kNumCells; c++) {
-            float cx = ((c % kGridWidth) + 0.5f) * cellSz;
-            float cy = ((c / kGridWidth) + 0.5f) * cellSz;
+        for (int c = 0; c < kFlowNumCells; c++) {
+            float cx = ((c % kFlowGridWidth) + 0.5f) * cellSz;
+            float cy = ((c / kFlowGridWidth) + 0.5f) * cellSz;
             for (uint32_t oi = 0; oi < _obstacleCount && !blocked[c]; oi++) {
                 float ax = obs[oi].x0, ay = obs[oi].y0;
                 float bx = obs[oi].x1, by = obs[oi].y1;
@@ -356,36 +371,76 @@ static const uint32_t kInitialObstacleCapacity = 64;
         }
     }
 
-    // ── Dijkstra (8-directional) — multi-source seeding ───────────────────
     static const int   NDX[] = {-1, 0, 1,-1, 1,-1, 0, 1};
     static const int   NDY[] = {-1,-1,-1, 0, 0, 1, 1, 1};
     static const float NDC[] = {1.414f,1.f,1.414f,1.f,1.f,1.414f,1.f,1.414f};
 
-    float cost[kNumCells];
-    std::fill(cost, cost+kNumCells, 1e30f);
+    // ── Pass 1: clearance field — shortest distance from each cell to any wall ─
+    // Cells close to walls pay a penalty in the main Dijkstra, which spreads agents
+    // across the full width of corridors and openings instead of all crowding the
+    // geometrically shortest (wall-hugging) corner path.
+    float wallDist[kFlowNumCells];
+    std::fill(wallDist, wallDist + kFlowNumCells, 1e30f);
 
     using PQ = std::priority_queue<std::pair<float,int>,
                                    std::vector<std::pair<float,int>>,
                                    std::greater<std::pair<float,int>>>;
-    PQ pq;
-
-    // Seed from evacuation exits (multi-source: nearest exit wins)
-    if (_evacExitCount > 0) {
-        const struct EvacExit *ex = (const struct EvacExit *)_exitBuffer.contents;
-        for (uint32_t e = 0; e < _evacExitCount; e++) {
-            int gcx = std::clamp((int)(ex[e].x / cellSz), 0, kGridWidth -1);
-            int gcy = std::clamp((int)(ex[e].y / cellSz), 0, kGridHeight-1);
-            int gc  = gcx + gcy * kGridWidth;
-            blocked[gc] = false;   // exit cell always passable
-            if (cost[gc] > 0.f) { cost[gc] = 0.f; pq.push({0.f, gc}); }
+    {
+        PQ wpq;
+        for (int c = 0; c < kFlowNumCells; c++) {
+            int cx = c % kFlowGridWidth, cy = c / kFlowGridWidth;
+            bool edge = (cx == 0 || cx == kFlowGridWidth-1 ||
+                         cy == 0 || cy == kFlowGridHeight-1);
+            if (blocked[c] || edge) { wallDist[c] = 0.f; wpq.push({0.f, c}); }
+        }
+        while (!wpq.empty()) {
+            auto [d, c] = wpq.top(); wpq.pop();
+            if (d > wallDist[c]) continue;
+            int cx = c % kFlowGridWidth, cy = c / kFlowGridWidth;
+            for (int i = 0; i < 8; i++) {
+                int nx = cx+NDX[i], ny = cy+NDY[i];
+                if (nx < 0 || nx >= kFlowGridWidth || ny < 0 || ny >= kFlowGridHeight) continue;
+                int nc = nx + ny*kFlowGridWidth;
+                float nd = d + NDC[i];
+                if (nd < wallDist[nc]) { wallDist[nc] = nd; wpq.push({nd, nc}); }
+            }
         }
     }
 
-    // Single-goal fallback (non-evacuation flow field)
+    // Clearance penalty: at 25 px/cell, 2 cells = 50 px from a wall.
+    static const float kClearRadius  = 2.0f;  // cells (= 50 px at 25 px/cell)
+    static const float kClearPenalty = 3.0f;
+
+    // ── Pass 2: Dijkstra (8-directional) — multi-source seeding ──────────────
+    float cost[kFlowNumCells];
+    std::fill(cost, cost+kFlowNumCells, 1e30f);
+
+    PQ pq;
+
+    if (_evacExitCount > 0) {
+        const struct EvacExit *ex = (const struct EvacExit *)_exitBuffer.contents;
+        for (uint32_t e = 0; e < _evacExitCount; e++) {
+            int x0 = std::max(0,                (int)((ex[e].x - ex[e].radius) / cellSz));
+            int x1 = std::min(kFlowGridWidth-1, (int)((ex[e].x + ex[e].radius) / cellSz));
+            int y0 = std::max(0,                 (int)((ex[e].y - ex[e].radius) / cellSz));
+            int y1 = std::min(kFlowGridHeight-1, (int)((ex[e].y + ex[e].radius) / cellSz));
+            for (int gy = y0; gy <= y1; gy++) {
+                for (int gx = x0; gx <= x1; gx++) {
+                    float ccx = (gx + 0.5f) * cellSz - ex[e].x;
+                    float ccy = (gy + 0.5f) * cellSz - ex[e].y;
+                    if (ccx*ccx + ccy*ccy > ex[e].radius * ex[e].radius) continue;
+                    int gc = gx + gy * kFlowGridWidth;
+                    blocked[gc] = false;
+                    if (cost[gc] > 0.f) { cost[gc] = 0.f; pq.push({0.f, gc}); }
+                }
+            }
+        }
+    }
+
     if (_flowGoalSet && _evacExitCount == 0) {
-        int gcx = std::clamp((int)(_flowGoalX / cellSz), 0, kGridWidth -1);
-        int gcy = std::clamp((int)(_flowGoalY / cellSz), 0, kGridHeight-1);
-        int gc  = gcx + gcy * kGridWidth;
+        int gcx = std::clamp((int)(_flowGoalX / cellSz), 0, kFlowGridWidth -1);
+        int gcy = std::clamp((int)(_flowGoalY / cellSz), 0, kFlowGridHeight-1);
+        int gc  = gcx + gcy * kFlowGridWidth;
         blocked[gc] = false;
         cost[gc]    = 0.f;
         pq.push({0.f, gc});
@@ -394,36 +449,58 @@ static const uint32_t kInitialObstacleCapacity = 64;
     while (!pq.empty()) {
         auto [d, c] = pq.top(); pq.pop();
         if (d > cost[c]) continue;
-        int cx = c % kGridWidth, cy = c / kGridWidth;
+        int cx = c % kFlowGridWidth, cy = c / kFlowGridWidth;
         for (int i = 0; i < 8; i++) {
             int nx = cx+NDX[i], ny = cy+NDY[i];
-            if (nx < 0 || nx >= kGridWidth || ny < 0 || ny >= kGridHeight) continue;
-            int nc = nx + ny*kGridWidth;
+            if (nx < 0 || nx >= kFlowGridWidth || ny < 0 || ny >= kFlowGridHeight) continue;
+            int nc = nx + ny*kFlowGridWidth;
             if (blocked[nc]) continue;
             if (NDX[i] != 0 && NDY[i] != 0)
-                if (blocked[(cx+NDX[i]) + cy*kGridWidth] ||
-                    blocked[cx + (cy+NDY[i])*kGridWidth]) continue;
-            float nd = d + NDC[i];
+                if (blocked[(cx+NDX[i]) + cy*kFlowGridWidth] ||
+                    blocked[cx + (cy+NDY[i])*kFlowGridWidth]) continue;
+            float clr = wallDist[nc];
+            float penalty = (clr < kClearRadius)
+                ? kClearPenalty * (1.f - clr / kClearRadius)
+                : 0.f;
+            float nd = d + NDC[i] + penalty;
             if (nd < cost[nc]) { cost[nc] = nd; pq.push({nd, nc}); }
         }
     }
 
-    // ── Derive flow vectors: steepest descent on cost field ───────────────
+    // ── Derive flow vectors ────────────────────────────────────────────────
     struct FlowVec { float x, y; };
     FlowVec *ff = (FlowVec *)_flowFieldBuffer.contents;
 
-    for (int c = 0; c < kNumCells; c++) {
+    const struct EvacExit *exitData = _evacExitCount > 0
+        ? (const struct EvacExit *)_exitBuffer.contents : nullptr;
+
+    for (int c = 0; c < kFlowNumCells; c++) {
         if (blocked[c] || cost[c] >= 1e29f) { ff[c] = {0.f,0.f}; continue; }
-        int cx = c % kGridWidth, cy = c / kGridWidth;
-        float best = cost[c];
+
+        if (cost[c] == 0.f && exitData) {
+            float pcx = (c % kFlowGridWidth + 0.5f) * cellSz;
+            float pcy = (c / kFlowGridWidth + 0.5f) * cellSz;
+            float bestD2 = 1e30f, dirX = 0.f, dirY = 0.f;
+            for (uint32_t e = 0; e < _evacExitCount; e++) {
+                float ddx = exitData[e].x - pcx, ddy = exitData[e].y - pcy;
+                float d2 = ddx*ddx + ddy*ddy;
+                if (d2 < bestD2) { bestD2 = d2; dirX = ddx; dirY = ddy; }
+            }
+            float len = std::sqrtf(dirX*dirX + dirY*dirY);
+            ff[c] = len > 0.001f ? FlowVec{dirX/len, dirY/len} : FlowVec{0.f,0.f};
+            continue;
+        }
+
+        int cx = c % kFlowGridWidth, cy = c / kFlowGridWidth;
         float bx = 0.f, by = 0.f;
         for (int i = 0; i < 8; i++) {
             int nx = cx+NDX[i], ny = cy+NDY[i];
-            if (nx < 0 || nx >= kGridWidth || ny < 0 || ny >= kGridHeight) continue;
-            if (cost[nx + ny*kGridWidth] < best) {
-                best = cost[nx + ny*kGridWidth];
-                bx = (float)NDX[i];
-                by = (float)NDY[i];
+            if (nx < 0 || nx >= kFlowGridWidth || ny < 0 || ny >= kFlowGridHeight) continue;
+            float nc_cost = cost[nx + ny*kFlowGridWidth];
+            if (nc_cost < cost[c]) {
+                float improvement = cost[c] - nc_cost;
+                bx += (float)NDX[i] * improvement;
+                by += (float)NDY[i] * improvement;
             }
         }
         float len = std::sqrtf(bx*bx + by*by);
@@ -454,7 +531,7 @@ static const uint32_t kInitialObstacleCapacity = 64;
 
     // Build blocked map (same logic as recomputeFlowField)
     const float cellSz = Simulation::kNeighborRadius;
-    const float blockR = cellSz * 0.5f;
+    const float blockR = 14.f;
     bool blocked[kNumCells] = {};
     if (_obstacleCount > 0) {
         const struct Obstacle *obs = (const struct Obstacle *)_obstacleBuffer.contents;
@@ -518,7 +595,11 @@ static const uint32_t kInitialObstacleCapacity = 64;
     _evacuationComplete = NO;
 
     SimParams *p      = (SimParams *)_params.contents;
-    p->agentCount     = (int)_agentCount;  // GPU always dispatches full N
+    // Limit GPU dispatch to the spawned count so the 99,500+ inactive agents at
+    // position (-9999,-9999) are never inserted into the spatial hash grid.
+    // Without this they all hash to cell (0,0), making agents near the top-left
+    // corner scan tens of thousands of dead entries every frame.
+    p->agentCount     = (int)count;
     _evacuationMode   = YES;
     p->evacuationMode = 1;
     _useFlowField     = YES;
@@ -530,7 +611,9 @@ static const uint32_t kInitialObstacleCapacity = 64;
 
 - (void)resetEvacuation {
     _evacuationMode = NO;
-    ((SimParams *)_params.contents)->evacuationMode = 0;
+    SimParams *p = (SimParams *)_params.contents;
+    p->evacuationMode = 0;
+    p->agentCount     = (int)_agentCount;  // restore full dispatch count
     _evacuationComplete = NO;
     float *act = (float *)_activeBuffer.contents;
     for (uint32_t i = 0; i < _agentCount; i++) act[i] = 1.f;
